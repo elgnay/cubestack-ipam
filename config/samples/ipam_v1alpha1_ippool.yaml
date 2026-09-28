@@ -1,0 +1,26 @@
+apiVersion: ipam.cubestack.io/v1alpha1
+kind: IPPool
+metadata:
+  labels:
+    app.kubernetes.io/name: cubestack-ipam
+    app.kubernetes.io/managed-by: kustomize
+  name: cubestack-static-v4
+spec:
+  # Cluster-scoped: an admin creates this, users claim from it.
+  subnet: 10.66.3.0/24
+
+  # The design's proposed band (design §5.4). It must be disjoint from BOTH the
+  # Whereabouts dynamic window (.200-.220) and the MetalLB pool (.221-.240).
+  #
+  # CAUTION: the source documents disagree about the 10.66.2.0/24 dynamic window
+  # and about the intended 10.66.3.0/24 static band -- see the README table. Verify
+  # against the live NAD before using this sample anywhere real:
+  #   kubectl get nad -n default vm-underlay-10-66-3-0 -o jsonpath='{.spec.config}'
+  range:
+    start: 10.66.3.150
+    end: 10.66.3.189
+
+  gateway: 10.66.3.254
+
+  # Bridge, routes and DNS are cloned from this NAD into each per-VM NAD.
+  templateNAD: default/vm-underlay-10-66-3-0

@@ -1,0 +1,18 @@
+apiVersion: ipam.cubestack.io/v1alpha1
+kind: IPRequest
+metadata:
+  labels:
+    app.kubernetes.io/name: cubestack-ipam
+    app.kubernetes.io/managed-by: kustomize
+  name: cubestack6-ip
+  namespace: default
+spec:
+  # IPPool is cluster-scoped, so this is a bare name with no namespace.
+  poolRef: cubestack-static-v4
+
+  # Optional. Naming an address makes the generated NAD name deterministic
+  # (vm-static-10-66-3-105), which is what lets the VM manifest be written before
+  # the request is satisfied. Omit it and the controller picks a free address --
+  # in that case there is no way to predict the NAD name, so the VM can only be
+  # created after reading status.nadName.
+  requestedIP: 10.66.3.105
