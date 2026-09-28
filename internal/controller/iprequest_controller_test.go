@@ -73,12 +73,14 @@ var _ = Describe("IPRequest Controller", func() {
 
 		ipam, ok := config["ipam"].(map[string]any)
 		Expect(ok).To(BeTrue())
-		// The two facts that make a per-VM NAD exclusive, and the reason the pool's
-		// own fields are the sole source of addressing.
-		Expect(ipam).To(HaveKeyWithValue("range_start", testFirstIP))
-		Expect(ipam).To(HaveKeyWithValue("range_end", testFirstIP))
-		Expect(ipam).To(HaveKeyWithValue("range", testSubnet))
-		Expect(ipam).To(HaveKeyWithValue("gateway", testGateway))
+		// The claim's address is baked in as a single static assignment. The pool's
+		// own fields remain the sole source of addressing -- the mask comes from
+		// testSubnet, the gateway from the template -- but nothing arbitrates the
+		// address at the CNI any more.
+		Expect(ipam).To(HaveKeyWithValue("type", "static"))
+		Expect(ipam).To(HaveKeyWithValue("addresses", []any{
+			map[string]any{"address": testFirstIP + "/24", "gateway": testGateway},
+		}))
 	})
 
 	It("gives the second claim the next address", func() {
@@ -91,6 +93,51 @@ var _ = Describe("IPRequest Controller", func() {
 
 		Expect(getClaim("default", "claims-two-a").Status.AssignedIP).To(Equal(testFirstIP))
 		Expect(getClaim("default", "claims-two-b").Status.AssignedIP).To(Equal(testSecondIP))
+	})
+
+	It("leases the address from Whereabouts when the pool asks for it", func() {
+		createPool("claims-whereabouts", testWhereaboutsPoolSpec())
+		createClaim("default", "claims-whereabouts-ip", "claims-whereabouts", "claims-whereabouts-static")
+		deleteNAD("default", "claims-whereabouts-static")
+
+		reconcileClaim("default", "claims-whereabouts-ip")
+
+		ipam, ok := renderedConfig(getNAD("default", "claims-whereabouts-static"))["ipam"].(map[string]any)
+		Expect(ok).To(BeTrue())
+		Expect(ipam).To(HaveKeyWithValue("type", "whereabouts"))
+		// The ledger is keyed by the range's CIDR, so this must be the subnet and not
+		// the pool's band: pointing it anywhere else puts this NAD on a different
+		// ledger from the dynamic pods it has to collide against.
+		Expect(ipam).To(HaveKeyWithValue("range", testSubnet))
+		// Both bounds on the assigned address is what bounds the candidate set to one,
+		// inside that shared ledger.
+		Expect(ipam).To(HaveKeyWithValue("range_start", testFirstIP))
+		Expect(ipam).To(HaveKeyWithValue("range_end", testFirstIP))
+		// And the static form's key is absent: the two shapes share almost nothing, so
+		// a leftover field here would be one mode bleeding into the other.
+		Expect(ipam).NotTo(HaveKey("addresses"))
+	})
+
+	It("defaults an unset ipam to Whereabouts", func() {
+		// The CRD's default, not just the renderer's. A pool created before the field
+		// existed must come back with it set, or every such pool would quietly lose the
+		// exclusivity the CNI was enforcing for it the first time it minted a NAD --
+		// and the rendered config would look entirely plausible either way.
+		spec := testPoolSpec()
+		spec.NADTemplate.IPAM = ""
+		createPool("claims-default-ipam", spec)
+
+		pool := &ipamv1alpha1.IPPool{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claims-default-ipam"}, pool)).To(Succeed())
+		Expect(pool.Spec.NADTemplate.IPAM).To(Equal("whereabouts"))
+
+		createClaim("default", "claims-default-ipam-ip", "claims-default-ipam", "claims-default-ipam-static")
+		deleteNAD("default", "claims-default-ipam-static")
+		reconcileClaim("default", "claims-default-ipam-ip")
+
+		ipam, ok := renderedConfig(getNAD("default", "claims-default-ipam-static"))["ipam"].(map[string]any)
+		Expect(ok).To(BeTrue())
+		Expect(ipam).To(HaveKeyWithValue("type", "whereabouts"))
 	})
 
 	It("binds a claim with no spec.nad without creating anything", func() {
@@ -235,7 +282,9 @@ var _ = Describe("IPRequest Controller", func() {
 		repair := getNAD("default", "claims-drift-static")
 		ipam, ok := renderedConfig(repair)["ipam"].(map[string]any)
 		Expect(ok).To(BeTrue())
-		Expect(ipam).To(HaveKeyWithValue("range_start", testFirstIP))
+		Expect(ipam).To(HaveKeyWithValue("addresses", []any{
+			map[string]any{"address": testFirstIP + "/24", "gateway": testGateway},
+		}))
 	})
 
 	It("clears the failure conditions once the pool is fixed", func() {

@@ -29,12 +29,13 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
 
 	ipamv1alpha1 "github.com/suanova/cubestack-ipam/api/v1alpha1"
+	"github.com/suanova/cubestack-ipam/internal/ipam"
 )
 
 // DefaultAuditInterval is how often the auditor sweeps a cluster with no
@@ -141,21 +142,48 @@ func (a *Auditor) RunOnce(ctx context.Context) ([]Finding, error) {
 		return nil, err
 	}
 
+	// Listed once and shared by the two checks that need it. They ask different
+	// questions of the same set -- which pools exist, and how each one addresses its
+	// claims -- and a second List would only invite the two answers to disagree.
+	pools, err := a.listPools(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	orphans, err := a.orphanedNADs(ctx, claims)
 	if err != nil {
 		return nil, err
 	}
 	findings = append(findings, orphans...)
 
-	findings = append(findings, a.duplicateAddresses(claims)...)
-
-	missing, err := a.danglingPoolRefs(ctx, claims)
-	if err != nil {
-		return nil, err
-	}
-	findings = append(findings, missing...)
+	findings = append(findings, a.duplicateAddresses(claims, pools)...)
+	findings = append(findings, a.danglingPoolRefs(claims, pools)...)
 
 	return findings, nil
+}
+
+// listPools returns every IPPool by name. The name is what a claim's poolRef holds,
+// so a claim can be matched to its pool without a second lookup.
+func (a *Auditor) listPools(ctx context.Context) (map[string]ipamv1alpha1.IPPool, error) {
+	var pools ipamv1alpha1.IPPoolList
+	if err := a.Client.List(ctx, &pools); err != nil {
+		return nil, fmt.Errorf("listing IPPools: %w", err)
+	}
+	out := make(map[string]ipamv1alpha1.IPPool, len(pools.Items))
+	for i := range pools.Items {
+		out[pools.Items[i].Name] = pools.Items[i]
+	}
+	return out, nil
+}
+
+// poolIPAMMode reads a pool's addressing mode, treating an absent template or an
+// unset field as whereabouts -- the same fallback the renderer makes, so a finding's
+// wording cannot disagree with the config the CNI was handed.
+func poolIPAMMode(pool *ipamv1alpha1.IPPool) string {
+	if pool.Spec.NADTemplate == nil || pool.Spec.NADTemplate.IPAM == "" {
+		return ipam.IPAMWhereabouts
+	}
+	return pool.Spec.NADTemplate.IPAM
 }
 
 func (a *Auditor) listClaims(ctx context.Context) ([]ipamv1alpha1.IPRequest, error) {
@@ -170,9 +198,10 @@ func (a *Auditor) listClaims(ctx context.Context) ([]ipamv1alpha1.IPRequest, err
 //
 // The direction matters. A NAD is normally collected by the garbage collector
 // through its ownerReference, so an orphan means that chain was broken — most
-// likely the ownerReference was stripped by hand. The address in that NAD's
-// Whereabouts ledger is still held, invisible to the claim layer, so the pool
-// reports it as free while the CNI still refuses to hand it out.
+// likely the ownerReference was stripped by hand. The address it carries is no
+// longer held by any claim, so the allocator considers it free and can hand it to
+// a new claim. If the orphaned NAD's VM is still running, the two now share an
+// address and nothing will refuse it.
 func (a *Auditor) orphanedNADs(ctx context.Context, claims []ipamv1alpha1.IPRequest) ([]Finding, error) {
 	// Indexed by namespace/name: the NAD is always created in its claim's
 	// namespace, so the label value alone would not be enough to identify it.
@@ -204,7 +233,7 @@ func (a *Auditor) orphanedNADs(ctx context.Context, claims []ipamv1alpha1.IPRequ
 			Name:      nad.GetName(),
 			Reason:    "OrphanedNAD",
 			Message: fmt.Sprintf("owned by IPRequest %s/%s, which no longer exists; "+
-				"its address is still held in the Whereabouts ledger and is not reported as free by any pool",
+				"its address is held by no claim and can be reassigned to another",
 				key.Namespace, key.Name),
 		})
 	}
@@ -214,11 +243,20 @@ func (a *Auditor) orphanedNADs(ctx context.Context, claims []ipamv1alpha1.IPRequ
 
 // duplicateAddresses finds two claims in one pool holding the same address.
 //
-// This is the residue of the allocation race documented in takenAddresses: the
-// second CNI ADD is refused, so the symptom a user sees is a VM that will not
-// start. Naming both claims is what turns that into something fixable, since
-// neither claim's own status shows anything wrong.
-func (a *Auditor) duplicateAddresses(claims []ipamv1alpha1.IPRequest) []Finding {
+// This is the residue of the allocation race documented in takenAddresses. Its
+// severity depends on the pool's mode, which is why the message says which one
+// applies rather than describing a fixed consequence:
+//
+//   - whereabouts: the ledger has one allocation slot per address, so the second CNI
+//     ADD is refused and that claim's VM does not start. Loud, and this finding
+//     explains a failure that already happened.
+//   - static: nothing refuses it. Both VMs come up on the address and the symptom is
+//     intermittent connectivity, so this is the only place the collision is stated at
+//     all.
+//
+// Naming both claims is what makes either fixable, since neither claim's own status
+// shows anything wrong.
+func (a *Auditor) duplicateAddresses(claims []ipamv1alpha1.IPRequest, pools map[string]ipamv1alpha1.IPPool) []Finding {
 	holders := map[string][]ipamv1alpha1.IPRequest{}
 	for i := range claims {
 		claim := claims[i]
@@ -251,6 +289,9 @@ func (a *Auditor) duplicateAddresses(claims []ipamv1alpha1.IPRequest) []Finding 
 		}
 		sort.Strings(names)
 
+		message := fmt.Sprintf("address %s in pool %s is held by %d claims: %s; %s",
+			addr, pool, len(group), strings.Join(names, ", "), duplicateConsequence(pools, pool))
+
 		// Reported on each claim, not once: whichever one a reader is looking at
 		// should say what is wrong with it.
 		for _, claim := range group {
@@ -259,14 +300,31 @@ func (a *Auditor) duplicateAddresses(claims []ipamv1alpha1.IPRequest) []Finding 
 				Namespace: claim.Namespace,
 				Name:      claim.Name,
 				Reason:    "DuplicateAddress",
-				Message: fmt.Sprintf("address %s in pool %s is also held by %s; "+
-					"only one of them can pass CNI ADD, so the other's VM will not start",
-					addr, pool, strings.Join(names, ", ")),
+				Message:   message,
 			})
 		}
 	}
 	sortFindings(findings)
 	return findings
+}
+
+// duplicateConsequence is the second half of the DuplicateAddress message: what the
+// collision actually does to the VMs.
+func duplicateConsequence(pools map[string]ipamv1alpha1.IPPool, poolName string) string {
+	pool, known := pools[poolName]
+	if !known {
+		// The pool is gone, so its mode is unknown. Say what is certainly true --
+		// two claims disagree about one address -- rather than guessing a mode and
+		// describing a consequence that may not follow.
+		return "the pool no longer exists, so which of them survives a CNI ADD depends on the NADs already out there"
+	}
+	if poolIPAMMode(&pool) == ipam.IPAMStatic {
+		return "this pool addresses statically, so nothing refuses a second holder: " +
+			"all of these VMs are up on one address and the symptom is intermittent connectivity, " +
+			"not a failed start"
+	}
+	return "this pool leases from Whereabouts, so only one can hold it at CNI ADD and " +
+		"the others' VMs will not start"
 }
 
 // danglingPoolRefs finds claims left behind by a deleted pool.
@@ -276,18 +334,9 @@ func (a *Auditor) duplicateAddresses(claims []ipamv1alpha1.IPRequest) []Finding 
 // that here would add nothing; what no single reconcile can say is how many claims
 // a deletion stranded, and that is the number an admin deciding whether to
 // recreate the pool needs.
-func (a *Auditor) danglingPoolRefs(ctx context.Context, claims []ipamv1alpha1.IPRequest) ([]Finding, error) {
-	var pools ipamv1alpha1.IPPoolList
-	if err := a.Client.List(ctx, &pools); err != nil {
-		return nil, fmt.Errorf("listing IPPools: %w", err)
-	}
-	known := make(map[string]struct{}, len(pools.Items))
-	for i := range pools.Items {
-		known[pools.Items[i].Name] = struct{}{}
-	}
-
+func (a *Auditor) danglingPoolRefs(claims []ipamv1alpha1.IPRequest, pools map[string]ipamv1alpha1.IPPool) []Finding {
 	var findings []Finding
-	for pool, group := range groupByPoolRef(claims, known) {
+	for pool, group := range groupByPoolRef(claims, pools) {
 		names := make([]string, 0, len(group))
 		for _, claim := range group {
 			names = append(names, claim.Namespace+"/"+claim.Name)
@@ -304,14 +353,14 @@ func (a *Auditor) danglingPoolRefs(ctx context.Context, claims []ipamv1alpha1.IP
 		})
 	}
 	sortFindings(findings)
-	return findings, nil
+	return findings
 }
 
-func groupByPoolRef(claims []ipamv1alpha1.IPRequest, known map[string]struct{}) map[string][]ipamv1alpha1.IPRequest {
+func groupByPoolRef(claims []ipamv1alpha1.IPRequest, pools map[string]ipamv1alpha1.IPPool) map[string][]ipamv1alpha1.IPRequest {
 	groups := map[string][]ipamv1alpha1.IPRequest{}
 	for i := range claims {
 		claim := claims[i]
-		if _, ok := known[claim.Spec.PoolRef]; ok {
+		if _, ok := pools[claim.Spec.PoolRef]; ok {
 			continue
 		}
 		groups[claim.Spec.PoolRef] = append(groups[claim.Spec.PoolRef], claim)

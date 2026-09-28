@@ -89,14 +89,15 @@ type IPPoolSpec struct {
 // at admission, instead of surfacing later as a VM stuck in FailedCreatePodSandBox.
 //
 // Addressing lives here rather than on IPPoolSpec because it is addressing OF
-// THE MINTED CONFIG, and is meaningless without one. subnet becomes the NAD's
-// ipam.range — which in a CNI config is what selects the Whereabouts allocation
-// ledger — and gateway becomes ipam.gateway. The claim's own address is not here:
-// range_start and range_end are injected per claim, from the address the
-// controller assigned it.
+// THE MINTED CONFIG, and is meaningless without one. subnet supplies the address's
+// prefix length and the containment check — there is no ipam.range any more, since
+// the address is written in statically rather than leased from Whereabouts — and
+// gateway becomes that address's gateway. The claim's own address is not here: it
+// is injected per claim, from the address the controller assigned it.
 type NADTemplate struct {
-	// subnet is the CIDR the minted NAD draws from, e.g. "10.66.3.0/24". It becomes
-	// ipam.range in the generated config.
+	// subnet is the CIDR the minted NAD's address belongs to, e.g. "10.66.3.0/24".
+	// It gives the generated config its prefix length, and is what the assigned
+	// address is checked against for containment.
 	//
 	// This is not the allocatable band — that is IPPool.spec.range, which must lie
 	// within this subnet. Several pools may share one subnet as long as their bands
@@ -111,6 +112,36 @@ type NADTemplate struct {
 	// +kubebuilder:validation:Pattern=`^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$`
 	// +required
 	Gateway string `json:"gateway"`
+
+	// ipam selects how the minted NAD is addressed. This is the one field here with
+	// a real trade-off rather than an obvious right answer, and the two modes cannot
+	// be combined: exclusivity and migratability are mutually exclusive.
+	//
+	// "whereabouts" leases the address from the Whereabouts ledger, which holds one
+	// allocation slot per address. A duplicate is therefore a loud CNI failure — the
+	// second ADD is refused and its VM will not start — and live migration is
+	// impossible, because migration deliberately runs the target pod while the
+	// source pod still serves, and both would need that one slot. The VMIM sits in
+	// Scheduling with no timeout.
+	//
+	// "static" writes the address into the NAD instead. Nothing arbitrates it, so
+	// two VMs can be given one address and neither will be refused; exclusivity then
+	// rests on the allocator, which is the single writer over spec.range, and on the
+	// audit's DuplicateAddress, which becomes the only detector. In exchange, live
+	// migration works and the guest keeps its address across it, because both pods
+	// can hold it at once.
+	//
+	// Choose per pool: a pool whose VMs must never collide silently wants
+	// whereabouts, a pool whose VMs have to move wants static.
+	//
+	// One consequence to respect. A static pool's addresses are invisible to
+	// Whereabouts, so its range must be disjoint from every Whereabouts range on the
+	// same subnet — the dynamic window as much as another pool's band. Overlap means
+	// silent collisions that the CNI will not catch.
+	// +kubebuilder:validation:Enum=whereabouts;static
+	// +kubebuilder:default=whereabouts
+	// +optional
+	IPAM string `json:"ipam,omitempty"`
 
 	// type is the CNI plugin type. cnv-bridge is the linux bridge binding used on
 	// this cluster's underlay.

@@ -5,14 +5,14 @@ Static, user-claimable IP addresses for KubeVirt VMs on a Multus + Whereabouts u
 > **STATUS: IMPLEMENTED, NOT YET ROLLED OUT.**
 >
 > Address allocation, claim lifecycle and per-VM NetworkAttachmentDefinition minting all work
-> and are covered by envtest. What has **not** happened is the thing the design gates on:
-> **spike 1 has not run**, so nobody has yet confirmed on a real VM that a single-address NAD
-> holds its address across a restart with the guest on plain DHCP. Everything here assumes it
-> does. If it does not, the approach is wrong rather than the code — see
-> [Spikes](#spikes-to-run-before-trusting-this).
+> and are covered by envtest. The mechanism the design gates on — a single-address NAD holding
+> its address across a restart, with the guest on plain DHCP — **has now been confirmed on real
+> hardware** (2026-09-28, see [Spikes](#spikes-to-run-before-trusting-this)). So has live
+> migration, under the addressing mode that permits it.
 >
-> The shared `vm-underlay-10-66-3-0` NAD has **not** been deleted. Doing so is a migration, not
-> a deploy — see [Retiring the shared underlay NAD](#retiring-the-shared-underlay-nad).
+> What has not happened is the rollout: the deployed pool still uses the older mode, and the
+> shared `vm-underlay-10-66-3-0` NAD has **not** been deleted. Doing so is a migration, not a
+> deploy — see [Retiring the shared underlay NAD](#retiring-the-shared-underlay-nad).
 
 ## What this is
 
@@ -30,12 +30,32 @@ IPAM plugin and no dataplane change:
   of where static VM addresses come from.
 - **`IPRequest`** — namespaced, created by a user or by the VirtualMachine controller, owned by
   the VM. The controller assigns it an address from the pool and — when the claim names a NAD —
-  mints a **per-VM NetworkAttachmentDefinition** whose Whereabouts range is that single address
-  (`range_start == range_end == <ip>`). The VM attaches to that NAD by a name it chose in advance,
-  and **the guest stays on plain DHCP**.
+  mints a **per-VM NetworkAttachmentDefinition** serving that one address. The VM attaches to
+  that NAD by a name it chose in advance, and **the guest stays on plain DHCP**.
 
-Because a single-address network has no second address to hand out, the binding is enforced by
-the CNI itself rather than by controller bookkeeping.
+Every minted NAD serves exactly the one address its claim holds, and that is what makes the
+address survive a pod restart: the binding is a property of the network the VM attaches to,
+not of the sandbox that happened to come up.
+
+**How that one address is expressed is a per-pool choice**, and it is the one real trade-off in
+this project (`nadTemplate.ipam`):
+
+| | `whereabouts` (default) | `static` |
+|---|---|---|
+| Address lives in | the Whereabouts ledger, leased at CNI `ADD` | the NAD itself, written in |
+| A second holder is | **refused**, and its VM does not start | **allowed**, silently |
+| Live migration | **impossible** | works, and the guest keeps its address |
+| Exclusivity rests on | the CNI | the allocator, the band split, the audit |
+
+The two cannot be combined on one pool, and that is a property of the mechanism rather than a
+gap in the code. Live migration deliberately runs the target pod *while the source pod is still
+serving*, so migration needs two pods to hold one address at once. Whereabouts stores one
+allocation slot per address, so it cannot grant that — the second `ADD` is refused and the
+`VirtualMachineInstanceMigration` sits in `Scheduling` forever, with no timeout.
+
+So: a pool whose VMs must never collide silently, and which can tolerate a stop/start to move,
+wants `whereabouts`. A pool whose VMs have to migrate wants `static`, and accepts that a
+collision becomes a silent duplicate rather than a loud failure.
 
 Full design: [`docs/kubevirt-vm-static-ip-design.md`](docs/kubevirt-vm-static-ip-design.md)
 (a copy of `design/vm/kubevirt-vm-static-ip-design.md`; the copy is the one bundled here).
@@ -50,7 +70,7 @@ Full design: [`docs/kubevirt-vm-static-ip-design.md`](docs/kubevirt-vm-static-ip
 `IPPool` divides along one line:
 
 - **`spec.range`** — what the *allocator* needs. The only required field.
-- **`spec.nadTemplate`** — what the *CNI* needs, including the addressing that config carries (`subnet`, `gateway`, `bridge`, …). Present means the pool mints networks; its fields are required exactly when it is present.
+- **`spec.nadTemplate`** — what the *CNI* needs, including the addressing that config carries (`subnet`, `gateway`, `ipam`, `bridge`, …). Present means the pool mints networks; its fields are required exactly when it is present.
 
 So a pool that mints nothing is a band and nothing else:
 
@@ -79,6 +99,7 @@ spec:
 |---|---|---|
 | `range` present, both bounds IPv4 | CRD schema | admission error |
 | `subnet`, `gateway`, `bridge` present when `nadTemplate` is | CRD schema | admission error |
+| `ipam` is one of `whereabouts` / `static` | CRD schema | admission error |
 | `range` inside `nadTemplate.subnet` | CRD schema (CEL) | admission error |
 | `range.start <= range.end` | controller | `Available=False/ReasonRangeInvalid` |
 | `gateway` outside `range` | controller | `Available=False/ReasonRangeInvalid` |
@@ -138,11 +159,11 @@ manifest be written before any address exists.
 
 ## Lifecycle
 
-1. Admin creates an `IPPool`: the band, and — if the pool should mint networks — the NAD template carrying its subnet, gateway and bridge.
+1. Admin creates an `IPPool`: the band, and — if the pool should mint networks — the NAD template carrying its subnet, gateway, bridge and an `ipam` mode.
 2. User creates a VM carrying `ipam.cubestack.io/pool` and naming its NAD.
 3. Controller #2 creates `IPRequest` `<vm-name>-ip` in the VM's namespace, owned by the VM.
 4. Controller #1 takes the **lowest free address** in the pool, then mints the NAD from the pool's
-   template with `range_start == range_end == <that address>`, owned by the claim.
+   template — carrying that one address, in the mode the template selected — owned by the claim.
 5. The guest stays on DHCP. No guest-side static configuration.
 6. Deleting the VM garbage-collects the claim, which garbage-collects the NAD.
 
@@ -160,8 +181,8 @@ re-derived — so a claim cannot move because another one appeared beneath it.
 | #1 | `IPPool`, `IPRequest` | Validates pools, allocates addresses, mints NADs |
 | #2 | `VirtualMachine` | Turns the annotation into a claim, and nothing else |
 
-The split is deliberate: the NAD's Whereabouts range *is* the assigned address, so both have to be
-written by one controller or the two can disagree.
+The split is deliberate: whichever mode a pool uses, the NAD's addressing *is* the assigned
+address, so both have to be written by one controller or the two can disagree.
 
 **Controller #2 is create-only.** It never patches the VM, and never patches a claim that already
 exists. So **editing `ipam.cubestack.io/pool` on a VM that already has a claim does nothing** apart
@@ -184,14 +205,27 @@ writes no status, so it cannot race the controllers it is checking.
 
 | Finding | Means |
 |---|---|
-| `OrphanedNAD` | A NAD of ours whose claim is gone. Its address is still held in the Whereabouts ledger and invisible to the claim layer |
-| `DuplicateAddress` | Two claims holding one address. Only one can pass CNI `ADD`, so the other's VM will not start |
+| `OrphanedNAD` | A NAD of ours whose claim is gone. Its address is held by no claim, so the allocator can hand it to a new one while the orphan's VM may still be running |
+| `DuplicateAddress` | Two claims holding one address. Names both, because neither claim's own status shows anything wrong |
 | `PoolDeleted` | Claims left behind by a deleted pool, reported once with a count |
 
 `DuplicateAddress` is the residue of a race that is documented rather than closed: two claims
 created in the same instant can both be reconciled against a cache that does not yet show the
-other's assignment. The window is small, and it fails loudly — the per-VM NADs share a Whereabouts
-ledger, so the second CNI `ADD` is refused instead of the two silently sharing an address.
+other's assignment. The window is small. **How bad the outcome is depends on the pool's mode, and
+that is the sharpest practical difference between them:**
+
+- On a `whereabouts` pool it fails *loudly* — the per-VM NADs share a ledger, so the second CNI
+  `ADD` is refused and the duplicate's VM does not start. This sweep is a backstop that explains
+  what already went wrong.
+- On a `static` pool nothing refuses it. Both VMs come up, both configure the same address, and
+  the symptom is intermittent connectivity rather than a failed start. **This sweep is the only
+  detector**, which is why it reports the collision on *both* claims rather than one.
+
+The same asymmetry applies to the band: on a `whereabouts` pool an address a dynamic pod already
+holds is refused at `ADD`, so overlap is survivable. On a `static` pool it is not — an address
+handed out of a band that reaches into the Whereabouts dynamic window collides silently. **A
+static pool's band being disjoint from every Whereabouts range on the subnet is load-bearing, not
+hygiene.**
 
 ## Deliberate omissions
 
@@ -200,27 +234,39 @@ ledger, so the second CNI `ADD` is refused instead of the two silently sharing a
 - **No cluster-wide NAD overlap sweep.** A pool's band must be disjoint from any other NAD on the
   same subnet, but with the shared NAD retired there is no longer a live object to audit against.
   This is an admin responsibility, bounded by RBAC: **regular users cannot create NADs**, so an
-  overlap can only be introduced deliberately.
+  overlap can only be introduced deliberately. It matters most for a `static` pool, where nothing
+  else would catch it — see above.
 - **MetalLB is not installed** on this cluster (no CRDs, no namespace, verified 2026-09-28), so the
   MetalLB half of design R5 is unenforceable and moot. If it is ever installed on this subnet, the
   band has to be re-checked against it.
-- **No live migration** for static-IP VMs. See below.
+- **No automatic choice of `ipam` mode.** It is per pool, made at creation, and not revisited.
 
-## Live migration is out of scope (decided 2026-09-28)
+## Live migration
 
-The design's biggest risk (§R1) and spike 2 were both about live migration: with
-`range_start == range_end` there is no fallback address, so a migrating VM's target pod asks
-for an address the source pod still holds. **This project does not support live migration
-for static-IP VMs**, which retires R1 and drops spike 2.
+Live migration is supported, but only on a pool whose `ipam` is `static` — see
+[What this is](#what-this-is) for why the two modes are mutually exclusive. The design's biggest
+risk (§R1) and spike 2 were both about this; both are now answered, the second one affirmatively
+and only for `static`.
 
-One consequence is easy to miss and worth acting on: if the cluster's `evictionStrategy` is
-`LiveMigrate` (set cluster-wide on the KubeVirt CR, or per-VM), then a **node drain will
-attempt exactly that migration**. Static-IP VMs should carry `evictionStrategy: None` so a
-drain restarts them instead. Verify which applies:
+Measured on this cluster 2026-09-28, with the NAD hand-switched to `static` while the controller
+was scaled down: live migration moved the VM from `10-66-3-47` to `10-66-3-46` in about 20
+seconds, `completed: True, failed: None`, and the **guest kept `10.66.3.221`**. At a sample taken
+10 seconds in, the source pod (`Running`) and the target pod (`Pending`) were both up holding that
+same address — which is exactly the state Whereabouts refuses and the whole reason the mode exists.
+
+The one thing to get right on a `whereabouts` pool is `evictionStrategy`. If it is `LiveMigrate`
+(cluster-wide on the KubeVirt CR, or per-VM), then a **node drain will attempt that migration**,
+and on a `whereabouts` pool the attempt hangs rather than failing fast. Such VMs should carry
+`spec.template.spec.evictionStrategy: None` so a drain restarts them instead. Static pools need no
+such override — the sample VM deliberately leaves it at the default. Check which applies:
 
 ```bash
 kubectl get kubevirt -n kubevirt -o jsonpath='{.items[0].spec.configuration.evictionStrategy}'
 ```
+
+Note the path: `spec.template.spec.evictionStrategy`, **not** `spec.evictionStrategy`. KubeVirt's
+CRD is structural, so the apiserver silently *prunes* a wrong field name rather than rejecting it —
+you get no error and no eviction strategy. Confirm it landed with `kubectl get vm -o jsonpath`.
 
 ## Retiring the shared underlay NAD
 
@@ -261,12 +307,19 @@ Verified live on 2026-09-28, and it is not what design §5.3 originally said. Th
 NAD declaring that same `range`. Its schema is `spec.range` plus `spec.allocations` keyed by last
 octet; there is no `spec.ranges[]` and no `ipPool:` field.
 
-That matters twice. First, it is why `ipam.range` in a minted NAD comes from `nadTemplate.subnet`
-rather than from the pool's allocatable band: the range selects the ledger, so a pool's band must
-sit inside it and the two cannot be the same field. Second, it is why per-VM NADs are safe:
-`range_start == range_end` bounds each network's candidate set to one address *within a shared
-ledger*, so exclusivity holds both against other claims and against dynamically-allocated pods —
-and a duplicate is refused by the CNI rather than silently shared.
+That matters twice. First, it is why `ipam.range` in a `whereabouts` minted NAD comes from
+`nadTemplate.subnet` rather than from the pool's allocatable band: the range selects the ledger,
+so a pool's band must sit inside it and the two cannot be the same field. Second, it is why
+per-VM NADs in that mode are safe: `range_start == range_end` bounds each network's candidate set
+to one address *within a shared ledger*, so exclusivity holds both against other claims and
+against dynamically-allocated pods — and a duplicate is refused by the CNI rather than silently
+shared.
+
+That last property is exactly what makes the mode unmigratable, so it is the one thing `static`
+gives up. A `static` pool's addresses never touch this ledger at all, which means the ledger
+cannot see them: it will happily hand a dynamic pod an address a static claim is already using,
+and the first symptom is a broken flow rather than a failed `ADD`. Splitting the bands is what
+keeps that from happening — see [The audit sweep](#the-audit-sweep).
 
 The `10.66.3.0/24` NAD that established this (and carries the config the sample's `nadTemplate`
 was copied from):
@@ -320,18 +373,25 @@ Cheapest first. Each needs one scratch VM. Record results in the design document
 
 | # | Spike | Decides | Status |
 |---|---|---|---|
-| 1 | Create a single-address NAD, start a scratch VM on it, restart it several times. Does the address hold with the guest on DHCP? | O1, R6 | **not run — the load-bearing assumption** |
-| 2 | ~~Live-migrate that VM between `10-66-3-46` and `10-66-3-47`~~ | O2, R1 | dropped, see above |
+| 1 | Create a single-address NAD, start a scratch VM on it, restart it several times. Does the address hold with the guest on DHCP? | O1, R6 | **run 2026-09-28 — PASSES.** `kubectl delete vmi` brought the VM back `Running` on the same `10.66.3.221`, new pod name, ledger entry re-pointed |
+| 2 | Live-migrate that VM between `10-66-3-46` and `10-66-3-47` | O2, R1 | **run 2026-09-28 — fails on `whereabouts`, PASSES on `static`** (moved in ~20s, guest kept `.221`). Resolved by making the mode a per-pool choice |
 | 3 | Stop/start the VM (`runStrategy` Halted → Always) — not just a pod restart. | O3 | not run |
 | 4 | Inspect whether a Whereabouts `IPPool` CR can carry workload affinity. | O4 | answered: it cannot |
 
 The controller was written before spike 1 ran, deliberately. Allocation, claiming and NAD minting
-do not depend on its answer. What depends on it is whether a single-address NAD is a usable address
-binding at all — and if it is not, that invalidates the approach, not the code.
+do not depend on its answer. What depended on it was whether a single-address NAD is a usable
+address binding at all — and it is.
+
+Both spike 1 results share a mechanism worth stating, because it is easy to get wrong: the address
+survives because the **NAD** serves it, not because the ledger remembers the pod. In `whereabouts`
+mode the claim's NAD pins `range_start == range_end`; in `static` mode it writes the address in.
+Either way, if the `IPRequest` is deleted while the VM is down, the address returns to the free
+pool and any claim can take it.
 
 ## Open questions
 
 - **O1** — Does a single-address NAD hold its address across a restart, with the guest on DHCP?
+  **Yes** (spike 1, 2026-09-28).
 - **O3** — Does it survive a stop/start, not just a pod restart?
 - **O5** — Should `IPPool` be cluster-scoped (as built) or namespaced for tenant isolation?
 - **O7** — How does an existing VM holding a dynamic address move onto a claim? The design

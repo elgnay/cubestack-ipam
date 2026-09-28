@@ -32,11 +32,12 @@ spec:
             name: ubuntu-22.04-server-amd64-img
             namespace: default
         storage:
-          # RWX + Block, not because of migration -- that is off the table above --
-          # but because it is what makes the disk independent of the node: the VM
-          # can be stopped and started elsewhere, and an unplanned node loss does
-          # not take the data with it. Block mode also skips the filesystem layer
-          # KubeVirt does not need here.
+          # RWX + Block. RWX is what live migration needs: the target pod attaches
+          # the same disk from another node while the source is still running, so a
+          # RWO volume would fail the migration. It is also what makes the disk
+          # independent of the node in general -- the VM can be stopped and started
+          # elsewhere and an unplanned node loss does not take the data with it.
+          # Block mode skips the filesystem layer KubeVirt does not need here.
           accessModes:
             - ReadWriteMany
           storageClassName: ceph-rbd-kubevirt
@@ -49,21 +50,24 @@ spec:
       labels:
         kubevirt.io/domain: cubestack6
     spec:
-      # Required for a static-IP VM, and not as a preference. A per-VM NAD pins one
-      # address via range_start == range_end, but live migration brings the target
-      # pod up *while the source pod is still serving*, so both need that same
-      # address at once. Whereabouts refuses the second CNI ADD and the migration
-      # hangs in Scheduling forever (measured 2026-09-28: "Could not allocate IP in
-      # range: ip: 10.66.3.221 / - 10.66.3.221"). With the default (LiveMigrate)
-      # KubeVirt offers the VM for migration on every node drain and every eviction,
-      # and those offers fail; the VM is then movable only by stopping and starting
-      # it. It sits under template.spec, NOT at spec.evictionStrategy -- KubeVirt's
-      # CRD is structural, so a wrong field name is silently pruned by the apiserver
-      # rather than rejected, and you get no warning at all.
-      evictionStrategy: None
-      # Which subnet the VM lands in is decided by the multus networkName below,
-      # and the nodeSelector has to agree with it or scheduling fails. Only
-      # 10-66-3-46/47 carry this label.
+      # Deliberately left at its default (LiveMigrate) rather than pinned. This
+      # sample claims from a pool whose ipam is static, and a static address is held
+      # by the target pod and the source pod at the same time -- which is exactly
+      # what migration needs, so the VM can be moved off a node for a drain or a
+      # patch without an outage.
+      #
+      # `evictionStrategy: None` is the thing to reach for if this VM is ever moved
+      # to a pool with ipam: whereabouts. There the address is leased and the ledger
+      # has one slot per address, so the second CNI ADD is refused and the VMIM sits
+      # in Scheduling forever (measured 2026-09-28: "Could not allocate IP in range:
+      # ip: 10.66.3.221 / - 10.66.3.221"). None keeps KubeVirt from offering the VM
+      # for migration on every drain, which leaves stop/start as the only way to
+      # move it -- the honest cost of that mode.
+      #
+      # Whichever way it is set, the field sits under template.spec, NOT at
+      # spec.evictionStrategy. KubeVirt's CRD is structural, so a wrong field name is
+      # silently pruned by the apiserver rather than rejected, and you get no warning
+      # at all -- check with `kubectl get vm -o jsonpath` that it actually landed.
       nodeSelector:
         kubevirt.io/subnet: 10-66-3-0
       domain:

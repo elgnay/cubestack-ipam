@@ -4,12 +4,21 @@ description: |
   Static, claimable underlay IP addresses for KubeVirt VMs on a Multus + Whereabouts
   network. Mints a per-VM single-address NetworkAttachmentDefinition per claim so the
   guest can stay on plain DHCP and still keep its address across a restart.
+
+  Each pool picks how that one address is expressed via nadTemplate.ipam: "whereabouts"
+  leases it, so a duplicate is refused by the CNI and live migration is impossible, while
+  "static" writes it in, so a duplicate is silent and live migration works. The two
+  cannot be combined -- see the README.
 type: application
 
 # version is the chart's own version; appVersion is the default image tag. Bump
 # `version` for any chart change, `appVersion` when the image moves.
-version: 0.1.0
-appVersion: "0.1.0"
+#
+# 0.2.0 adds nadTemplate.ipam to the IPPool schema. Because Helm never upgrades
+# crds/, this release must be applied with `kubectl apply -f charts/cubestack-ipam/crds/`
+# before `helm upgrade`, or the new field is silently pruned by the old schema.
+version: 0.2.0
+appVersion: "0.2.0"
 
 keywords:
   - kubevirt

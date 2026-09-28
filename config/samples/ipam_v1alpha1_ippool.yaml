@@ -27,8 +27,13 @@ spec:
   # .221-.240 sits immediately above the shared vm-underlay-10-66-3-0 NAD's
   # dynamic window (.200-.220), so the two cannot contend: Whereabouts hands out
   # .200-.220 to dynamically-addressed pods and this pool hands out .221-.240 to
-  # claims, out of the same 10.66.3.0/24 ledger. Both bands are disjoint from the
-  # ledger's eight existing allocations, all in .200-.208.
+  # claims. Both bands are disjoint from the ledger's eight existing allocations,
+  # all in .200-.208.
+  #
+  # That split matters MORE with ipam: static than it did before, because the CNI
+  # no longer refuses a duplicate -- this band being disjoint from the dynamic
+  # window is now the only thing keeping a claim out of an address a pod already
+  # holds. See the ipam field below.
   #
   # The design originally proposed .150-.189 for this subnet; this band replaces
   # it to sit hard against the dynamic window rather than leaving a gap.
@@ -48,15 +53,39 @@ spec:
   # reads that NAD any more; they live here now so the pool describes the underlay
   # by itself.
   nadTemplate:
-    # The CIDR the minted NADs draw from -- it becomes ipam.range, which in a CNI
-    # config is what selects the Whereabouts allocation ledger. NOT the allocatable
-    # band: that is range above, which must lie inside this subnet. Several pools
-    # may share one subnet as long as their bands are disjoint.
+    # The CIDR the minted NADs' addresses belong to. It supplies their prefix
+    # length and the containment check, and in the whereabouts mode below it also
+    # becomes ipam.range, which is what selects the allocation ledger. NOT the
+    # allocatable band: that is range above, which must lie inside this subnet.
+    # Several pools may share one subnet as long as their bands are disjoint.
     subnet: 10.66.3.0/24
 
     # The default gateway. Must be inside subnet (a bridge binding needs it on the
     # same L2) and outside range above.
     gateway: 10.66.3.254
+
+    # How the minted NAD is addressed. The two modes trade exclusivity against
+    # migratability, and cannot be combined on one pool:
+    #
+    #   whereabouts -- the address is leased from the Whereabouts ledger. A second
+    #     holder is refused at CNI ADD and its VM does not start, so a collision is
+    #     LOUD. Live migration is impossible: it runs the target pod while the
+    #     source pod still serves, so both need that one address at once and the
+    #     ledger has a single slot per address. The VMIM sits in Scheduling forever.
+    #
+    #   static -- the address is written into the NAD. Nothing arbitrates it, so a
+    #     collision is SILENT: both VMs start and the symptom is intermittent
+    #     connectivity. In exchange live migration works and the guest keeps its
+    #     address across it. Exclusivity then rests on the band above being disjoint
+    #     from every Whereabouts range on this subnet, on the allocator being the
+    #     sole writer over range, and on the audit sweep's DuplicateAddress -- which
+    #     becomes the only detector rather than a backstop behind the CNI.
+    #
+    # This pool is static because its VMs have to be able to move: a node drain or
+    # a patch should not need an outage. A pool whose VMs must never collide
+    # silently, and whose VMs can tolerate stop/start, wants whereabouts. Omitting
+    # the field means whereabouts.
+    ipam: static
 
     type: cnv-bridge
     bridge: br0

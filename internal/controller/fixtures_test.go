@@ -40,17 +40,32 @@ const (
 )
 
 // testPoolSpec is a pool with a template, i.e. one that can mint NADs.
+//
+// It selects static explicitly rather than leaning on the field being absent, so
+// that the ipam assertions in this suite are about the mode they name. The
+// whereabouts form has its own pool below, and the default that an omitted field
+// falls back to is pinned by its own test -- those are three different facts and a
+// shared fixture would blur them.
 func testPoolSpec() ipamv1alpha1.IPPoolSpec {
 	return ipamv1alpha1.IPPoolSpec{
 		Range: ipamv1alpha1.IPRange{Start: testFirstIP, End: testThirdIP},
 		NADTemplate: &ipamv1alpha1.NADTemplate{
 			Subnet:  testSubnet,
 			Gateway: testGateway,
+			IPAM:    "static",
 			Bridge:  "br0",
 			DNS:     &ipamv1alpha1.NADDNS{Nameservers: []string{testGateway}},
 			Routes:  []ipamv1alpha1.NADRoute{{Dst: "0.0.0.0/0", GW: testGateway}},
 		},
 	}
+}
+
+// testWhereaboutsPoolSpec is testPoolSpec with the address leased from Whereabouts
+// instead, exchanging migratability for exclusivity the CNI enforces.
+func testWhereaboutsPoolSpec() ipamv1alpha1.IPPoolSpec {
+	spec := testPoolSpec()
+	spec.NADTemplate.IPAM = "whereabouts"
+	return spec
 }
 
 // testLedgerOnlySpec is the minimal pool: a band and nothing else. It allocates

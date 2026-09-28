@@ -30,11 +30,40 @@ import (
 // underlay, and mirrors the CRD's own default for the field.
 const DefaultCNIType = "cnv-bridge"
 
-// whereaboutsIPAM is the only IPAM plugin this project generates. It is not a
-// template field: the whole premise is a thin claim layer over the Whereabouts
-// already installed (design §2), so an alternative here would mean a different
-// cluster design rather than a different pool.
-const whereaboutsIPAM = "whereabouts"
+// The two IPAM plugins this project can generate, selected by the pool template's
+// ipam field. See NADTemplate.IPAM for the full statement of the trade-off; the
+// short version is that whereabouts buys CNI-enforced exclusivity at the price of
+// live migration, and static buys live migration at the price of that enforcement.
+//
+// They cannot be combined on one pool, and that is a property of the mechanism
+// rather than a gap in this code: migration deliberately runs the target pod while
+// the source pod still serves, so two pods must hold one address at once, and the
+// Whereabouts ledger stores one allocation per address (spec.allocations is keyed
+// by last octet, one podref each).
+const (
+	// IPAMWhereabouts leases the address from the Whereabouts ledger. A duplicate is
+	// refused at CNI ADD and its VM does not start; live migration is impossible.
+	IPAMWhereabouts = "whereabouts"
+
+	// IPAMStatic writes the address into the NAD. Live migration works and the guest
+	// keeps its address across it. Nothing refuses a duplicate, so exclusivity rests
+	// on the allocator being the single writer over spec.range, on the pool's range
+	// being disjoint from anything else on the subnet, and on the audit sweep.
+	IPAMStatic = "static"
+)
+
+// ipamMode resolves the template's choice, treating unset as Whereabouts.
+//
+// That default matches the CRD's, and matters on upgrade: a template written before
+// this field existed must keep the behaviour it was created with rather than
+// silently losing its CNI-enforced exclusivity. Opting into static is a deliberate
+// act with a stated cost, not something to inherit by accident.
+func ipamMode(tmpl *ipamv1alpha1.NADTemplate) string {
+	if tmpl.IPAM == "" {
+		return IPAMWhereabouts
+	}
+	return tmpl.IPAM
+}
 
 // nadConfig mirrors the NetworkAttachmentDefinition spec.config this project
 // generates. It is a separate type from v1alpha1.NADTemplate because the two have
@@ -44,22 +73,42 @@ const whereaboutsIPAM = "whereabouts"
 // Field order matters only in that encoding/json emits it in declaration order,
 // which is what makes the rendered output stable enough to golden-test.
 type nadConfig struct {
-	Name        string      `json:"name"`
-	Type        string      `json:"type"`
-	Bridge      string      `json:"bridge"`
-	VLAN        *int32      `json:"vlan,omitempty"`
-	MacSpoofChk *bool       `json:"macspoofchk,omitempty"`
-	IPAM        nadIPAM     `json:"ipam"`
-	DNS         *nadDNS     `json:"dns,omitempty"`
+	Name        string  `json:"name"`
+	Type        string  `json:"type"`
+	Bridge      string  `json:"bridge"`
+	VLAN        *int32  `json:"vlan,omitempty"`
+	MacSpoofChk *bool   `json:"macspoofchk,omitempty"`
+	IPAM        any     `json:"ipam"`
+	DNS         *nadDNS `json:"dns,omitempty"`
 }
 
-type nadIPAM struct {
+// nadIPAMStatic is the ipam block for a static assignment: the address is written
+// in, and nothing arbitrates it.
+type nadIPAMStatic struct {
+	Type      string       `json:"type"`
+	Addresses []nadAddress `json:"addresses"`
+	Routes    []nadRoute   `json:"routes,omitempty"`
+}
+
+// nadIPAMWhereabouts is the ipam block for a Whereabouts lease. Range identifies
+// the allocation ledger -- every NAD declaring the same range shares one, which is
+// what makes a duplicate a loud CNI failure -- while range_start == range_end
+// bounds this NAD's candidates to the one address assigned to the claim.
+type nadIPAMWhereabouts struct {
 	Type       string     `json:"type"`
 	Range      string     `json:"range"`
 	RangeStart string     `json:"range_start"`
 	RangeEnd   string     `json:"range_end"`
 	Gateway    string     `json:"gateway"`
 	Routes     []nadRoute `json:"routes,omitempty"`
+}
+
+// nadAddress is one entry of the static plugin's address list. The address
+// carries its own prefix length, which is why the assigned address alone is not
+// enough to render one: the mask comes from the template's subnet.
+type nadAddress struct {
+	Address string `json:"address"`
+	Gateway string `json:"gateway,omitempty"`
 }
 
 type nadDNS struct {
@@ -76,16 +125,14 @@ type nadRoute struct {
 // RenderNAD builds the spec.config of the per-VM NetworkAttachmentDefinition for
 // one claim.
 //
-// RangeStart and RangeEnd are both set to addr, which is the whole mechanism: a
-// band holding a single address has no second address to hand out, so the CNI
-// itself enforces that this NAD can only ever serve the address assigned to it.
-// The claim ledger and the dataplane therefore cannot drift apart as long as
-// allocation is single-writer.
+// Whichever mode the template selects, this NAD serves addr and no other, and the
+// invariant is upheld by the allocator, which is the sole writer over the pool's
+// range. What differs is whether the CNI also enforces it:
 //
-// The ipam range is the template's subnet rather than the assigned address,
-// because Whereabouts derives its allocation ledger from the range — every NAD
-// sharing a range shares one ledger, which is what makes a duplicate a loud CNI
-// failure rather than a silent one.
+//   - static bakes addr in, so nothing arbitrates it. Two pods may hold it at once,
+//     which is precisely what live migration needs.
+//   - whereabouts pins range_start == range_end inside the range's shared ledger, so
+//     a second holder is refused at CNI ADD and the VM does not start.
 //
 // tmpl may not be nil: a pool without a template cannot mint, and the caller is
 // expected to have reported that as a TemplateMissing condition already. The
@@ -130,14 +177,7 @@ func RenderNAD(tmpl *ipamv1alpha1.NADTemplate, name string, addr netip.Addr) (st
 		Bridge:      tmpl.Bridge,
 		VLAN:        tmpl.VLAN,
 		MacSpoofChk: tmpl.MacSpoofChk,
-		IPAM: nadIPAM{
-			Type:       whereaboutsIPAM,
-			Range:      tmpl.Subnet,
-			RangeStart: addr.String(),
-			RangeEnd:   addr.String(),
-			Gateway:    tmpl.Gateway,
-			Routes:     routes(tmpl.Routes),
-		},
+		IPAM:        renderIPAM(tmpl, addr, prefix),
 	}
 	if tmpl.DNS != nil {
 		cfg.DNS = &nadDNS{
@@ -152,6 +192,45 @@ func RenderNAD(tmpl *ipamv1alpha1.NADTemplate, name string, addr netip.Addr) (st
 		return "", fmt.Errorf("rendering NAD config: %w", err)
 	}
 	return string(out), nil
+}
+
+// renderIPAM builds the ipam block for the template's mode.
+//
+// It returns either concrete struct, and the caller stores it as `any`, so that
+// only the selected mode's fields reach the config: the two shapes share almost no
+// keys, and emitting both would hand the CNI an ipam block it would have to
+// interpret. It never fails — the address and subnet were validated above, which is
+// everything either shape needs.
+func renderIPAM(tmpl *ipamv1alpha1.NADTemplate, addr netip.Addr, prefix netip.Prefix) any {
+	if ipamMode(tmpl) == IPAMStatic {
+		return nadIPAMStatic{
+			Type: IPAMStatic,
+			Addresses: []nadAddress{{
+				// The mask comes from the template's subnet: it is the only place the
+				// prefix length is declared, and the static plugin wants a CIDR rather
+				// than a bare address.
+				Address: netip.PrefixFrom(addr, prefix.Bits()).String(),
+				Gateway: tmpl.Gateway,
+			}},
+			Routes: routes(tmpl.Routes),
+		}
+	}
+
+	return nadIPAMWhereabouts{
+		Type: IPAMWhereabouts,
+		// The range, not the subnet: where the ledger lives. IPPool.spec.range is the
+		// band within that subnet this pool may hand out, and the ledger is keyed by
+		// the range's CIDR -- every NAD declaring the same one shares it, which is what
+		// makes a duplicate a refusal rather than two VMs quietly sharing an address.
+		Range:      tmpl.Subnet,
+		RangeStart: addr.String(),
+		// Pinning both ends to the assigned address is what bounds this NAD's
+		// candidates to one, and it is the whole reason the per-VM NAD gives
+		// exclusivity at all.
+		RangeEnd: addr.String(),
+		Gateway:  tmpl.Gateway,
+		Routes:   routes(tmpl.Routes),
+	}
 }
 
 func cniType(tmpl *ipamv1alpha1.NADTemplate) string {

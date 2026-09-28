@@ -49,8 +49,8 @@ const (
 //
 // An IPRequest is created by a user and is owned by the VM it serves. On creation
 // the controller assigns an address from the referenced pool, and — when nad is
-// set — mints a per-VM NetworkAttachmentDefinition whose Whereabouts range is
-// that single address (design §5.2 steps 3-4).
+// set — mints a per-VM NetworkAttachmentDefinition carrying that address as a
+// single static assignment (design §5.2 steps 3-4).
 type IPRequestSpec struct {
 	// poolRef names the IPPool to claim from. IPPool is cluster-scoped, so this is
 	// a bare name with no namespace.

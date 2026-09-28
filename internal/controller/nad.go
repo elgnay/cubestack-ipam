@@ -61,11 +61,11 @@ func newNAD(namespace, name string) *unstructured.Unstructured {
 
 // ensureNAD makes the per-VM NetworkAttachmentDefinition for a bound claim.
 //
-// The rendered config pins the NAD's Whereabouts range to this claim's address, so
-// the CNI can hand out that address and no other. Everything else — bridge, DNS,
-// routes — comes from the pool's template, which is why the pool has to be
-// reachable here: the NAD is a function of the pool and the address, not of the
-// VM.
+// The rendered config serves this claim's address and no other — as a static
+// assignment or as a Whereabouts range pinned to it, depending on the pool's
+// ipam mode. Everything else — bridge, DNS, routes — comes from the pool's
+// template, which is why the pool has to be reachable here: the NAD is a function
+// of the pool and the address, not of the VM.
 //
 // Ownership is the pool of record for what this function may touch. An existing
 // NAD is adopted only when it is already controller-owned by this claim, which is

@@ -84,8 +84,9 @@ var _ = Describe("Auditor", func() {
 
 	It("reports two claims holding one address", func() {
 		// The residue of the allocation race: neither claim's own status shows
-		// anything wrong, and the symptom is a VM that will not start.
-		createPool("audit-dup", testPoolSpec())
+		// anything wrong, and the symptom depends on the pool's mode -- which the
+		// message has to state, since that is the only thing a reader can act on.
+		createPool("audit-dup", testPoolSpec()) // static
 		for _, name := range []string{"audit-dup-a", "audit-dup-b"} {
 			createClaim("default", name, "audit-dup", "")
 			claim := getClaim("default", name)
@@ -105,6 +106,31 @@ var _ = Describe("Auditor", func() {
 		b := withName(duplicates, "audit-dup-b")
 		Expect(b).To(HaveLen(1))
 		Expect(b[0].Message).To(ContainSubstring("audit-dup-a"))
+
+		// Static: nothing refuses the duplicate, so the finding must not promise a
+		// failed start -- that would send a reader looking for a VM that never
+		// started when in fact both are running.
+		Expect(a[0].Message).To(ContainSubstring("intermittent connectivity"))
+		Expect(a[0].Message).NotTo(ContainSubstring("will not start"))
+	})
+
+	It("reports a whereabouts duplicate as a failed start", func() {
+		// The other half of the same check. The wording is not decoration: which
+		// consequence applies is decided entirely by the mode, so a message that
+		// ignored it would be wrong half the time and confidently so.
+		createPool("audit-dup-wa", testWhereaboutsPoolSpec())
+		for _, name := range []string{"audit-dup-wa-a", "audit-dup-wa-b"} {
+			createClaim("default", name, "audit-dup-wa", "")
+			claim := getClaim("default", name)
+			claim.Status.AssignedIP = testFirstIP
+			claim.Status.Phase = ipamv1alpha1.IPRequestPhaseBound
+			Expect(k8sClient.Status().Update(ctx, claim)).To(Succeed())
+		}
+
+		a := withName(withReason(sweep(), "DuplicateAddress"), "audit-dup-wa-a")
+		Expect(a).To(HaveLen(1))
+		Expect(a[0].Message).To(ContainSubstring("will not start"))
+		Expect(a[0].Message).NotTo(ContainSubstring("intermittent connectivity"))
 	})
 
 	It("does not report distinct addresses", func() {

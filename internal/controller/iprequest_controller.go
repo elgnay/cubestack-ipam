@@ -43,9 +43,9 @@ import (
 //
 // # Why this reconciler mints the NAD
 //
-// The NAD's Whereabouts range is the assigned address, so the address and the NAD
-// are one fact. Splitting them across two controllers would give that fact two
-// writers that can disagree; keeping both here makes disagreement structurally
+// The NAD carries the assigned address, so the address and
+// the NAD are one fact. Splitting them across two controllers would give that fact
+// two writers that can disagree; keeping both here makes disagreement structurally
 // impossible rather than merely unlikely. It also keeps a claim usable on its own:
 // a hand-written IPRequest with no VirtualMachine behind it still gets its NAD.
 type IPRequestReconciler struct {
@@ -224,12 +224,15 @@ func (r *IPRequestReconciler) assign(ctx context.Context, claim *ipamv1alpha1.IP
 //
 // KNOWN RACE: two claims created in the same instant can both be reconciled
 // against a cache that does not yet show the other's assignment, and both pick the
-// same address. The window is small and the consequence is bounded and loud: the
-// per-VM NADs share one Whereabouts ledger, so the second is refused at CNI ADD
-// and its VM does not start, rather than the two silently sharing an address. The
-// audit sweep reports the collision after the fact. Closing it properly needs a
-// compare-and-swap on something address-shaped, which this API gave up when
-// per-address claim objects were dropped.
+// same address. The window is small, but how bad it is depends on the pool's ipam
+// mode, and that is worth knowing before assuming the CNI is behind this. On a
+// whereabouts pool the second CNI ADD is refused, so the collision is loud and the
+// audit explains a failure that already happened. On a static pool nothing refuses
+// it: both VMs come up sharing an address and the symptom is intermittent
+// connectivity, which makes the audit sweep's DuplicateAddress the only detector
+// rather than a backstop. Closing the race properly needs a compare-and-swap on
+// something address-shaped, which this API gave up when per-address claim objects
+// were dropped.
 func (r *IPRequestReconciler) takenAddresses(ctx context.Context, claim *ipamv1alpha1.IPRequest) (map[netip.Addr]struct{}, error) {
 	var claims ipamv1alpha1.IPRequestList
 	if err := r.List(ctx, &claims); err != nil {
