@@ -17,72 +17,95 @@ limitations under the License.
 package controller
 
 import (
-	"context"
-
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	ipamv1alpha1 "github.com/suanova/cubestack-ipam/api/v1alpha1"
 )
 
 var _ = Describe("IPPool Controller", func() {
-	Context("When reconciling a resource", func() {
-		const resourceName = "test-resource"
+	reconcilePool := func(name string) {
+		r := &IPPoolReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: types.NamespacedName{Name: name}})
+		ExpectWithOffset(1, err).NotTo(HaveOccurred())
+	}
 
-		ctx := context.Background()
+	conditionOf := func(name, conditionType string) *metav1.Condition {
+		pool := &ipamv1alpha1.IPPool{}
+		ExpectWithOffset(1, k8sClient.Get(ctx, types.NamespacedName{Name: name}, pool)).To(Succeed())
+		return apimeta.FindStatusCondition(pool.Status.Conditions, conditionType)
+	}
 
-		// IPPool is cluster-scoped (design §5.1), so there is deliberately no
-		// namespace in this key.
-		typeNamespacedName := types.NamespacedName{Name: resourceName}
-		ippool := &ipamv1alpha1.IPPool{}
+	It("publishes Available=True for a usable pool", func() {
+		createPool("pool-valid", testPoolSpec())
+		reconcilePool("pool-valid")
 
-		BeforeEach(func() {
-			By("creating the custom resource for the Kind IPPool")
-			err := k8sClient.Get(ctx, typeNamespacedName, ippool)
-			if err != nil && errors.IsNotFound(err) {
-				resource := &ipamv1alpha1.IPPool{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: resourceName,
-					},
-					// The band the design proposes for 10.66.3.0/24 (design §5.4).
-					Spec: ipamv1alpha1.IPPoolSpec{
-						Subnet:      "10.66.3.0/24",
-						Range:       ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
-						Gateway:     "10.66.3.254",
-						TemplateNAD: "default/vm-underlay-10-66-3-0",
-					},
-				}
-				Expect(k8sClient.Create(ctx, resource)).To(Succeed())
-			}
-		})
+		available := conditionOf("pool-valid", ipamv1alpha1.ConditionAvailable)
+		Expect(available).NotTo(BeNil())
+		Expect(available.Status).To(Equal(metav1.ConditionTrue))
+		Expect(available.Reason).To(Equal(ipamv1alpha1.ReasonRangeValid))
+	})
 
-		AfterEach(func() {
-			// TODO(user): Cleanup logic after each test, like removing the resource instance.
-			resource := &ipamv1alpha1.IPPool{}
-			err := k8sClient.Get(ctx, typeNamespacedName, resource)
-			Expect(err).NotTo(HaveOccurred())
+	It("accepts a pool with no nadTemplate", func() {
+		// A pool need not serve claims that ask for a NAD, so this is a valid pool
+		// and must not be reported as broken. It is also the minimal form of the
+		// API: a band with no subnet and no gateway, because it mints nothing.
+		createPool("pool-no-template", testLedgerOnlySpec())
+		reconcilePool("pool-no-template")
 
-			By("Cleanup the specific resource instance IPPool")
-			Expect(k8sClient.Delete(ctx, resource)).To(Succeed())
-		})
-		It("should successfully reconcile the resource", func() {
-			By("Reconciling the created resource")
-			controllerReconciler := &IPPoolReconciler{
-				Client: k8sClient,
-				Scheme: k8sClient.Scheme(),
-			}
+		available := conditionOf("pool-no-template", ipamv1alpha1.ConditionAvailable)
+		Expect(available).NotTo(BeNil())
+		Expect(available.Status).To(Equal(metav1.ConditionTrue))
+		Expect(available.Reason).To(Equal(ipamv1alpha1.ReasonRangeValid))
+		// The message must not name a subnet the pool does not have.
+		Expect(available.Message).NotTo(ContainSubstring("subnet"))
+	})
 
-			_, err := controllerReconciler.Reconcile(ctx, reconcile.Request{
-				NamespacedName: typeNamespacedName,
-			})
-			Expect(err).NotTo(HaveOccurred())
-			// TODO(user): Add more specific assertions depending on your controller's reconciliation logic.
-			// Example: If you expect a certain status condition after reconciliation, verify it here.
-		})
+	It("publishes Available=False when the gateway falls inside the range", func() {
+		// The one invariant the CRD cannot express: the CEL net library has no
+		// ordering overload on IP values, so "gateway is outside the band" is
+		// enforced only here — and this condition is the only place a user sees it.
+		spec := testPoolSpec()
+		spec.NADTemplate.Gateway = testSecondIP
+		createPool("pool-gateway-inside", spec)
+		reconcilePool("pool-gateway-inside")
+
+		available := conditionOf("pool-gateway-inside", ipamv1alpha1.ConditionAvailable)
+		Expect(available).NotTo(BeNil())
+		Expect(available.Status).To(Equal(metav1.ConditionFalse))
+		Expect(available.Reason).To(Equal(ipamv1alpha1.ReasonRangeInvalid))
+		Expect(available.Message).To(ContainSubstring("gateway"))
+	})
+
+	It("publishes Available=False when the gateway is off-subnet", func() {
+		// A gateway in another subnet is outside the band, so the range check alone
+		// would pass it — and bridge binding cannot reach it.
+		spec := testPoolSpec()
+		spec.NADTemplate.Gateway = "10.66.9.254"
+		createPool("pool-gateway-offsubnet", spec)
+		reconcilePool("pool-gateway-offsubnet")
+
+		available := conditionOf("pool-gateway-offsubnet", ipamv1alpha1.ConditionAvailable)
+		Expect(available).NotTo(BeNil())
+		Expect(available.Status).To(Equal(metav1.ConditionFalse))
+		Expect(available.Reason).To(Equal(ipamv1alpha1.ReasonRangeInvalid))
+		Expect(available.Message).To(ContainSubstring("must lie within subnet"))
+	})
+
+	It("does not rewrite status when nothing changed", func() {
+		// The reconcilers do not requeue on success, so an unconditional status
+		// write would be the only thing generating further reconciles.
+		createPool("pool-idempotent", testPoolSpec())
+		reconcilePool("pool-idempotent")
+
+		before := conditionOf("pool-idempotent", ipamv1alpha1.ConditionAvailable)
+		reconcilePool("pool-idempotent")
+		after := conditionOf("pool-idempotent", ipamv1alpha1.ConditionAvailable)
+
+		Expect(after.LastTransitionTime).To(Equal(before.LastTransitionTime))
 	})
 })

@@ -196,7 +196,28 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "iprequest")
 		os.Exit(1)
 	}
+	if err := (&controller.VirtualMachineReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("cubestack-ipam-vm"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "virtualmachine")
+		os.Exit(1)
+	}
 	// +kubebuilder:scaffold:builder
+
+	// The audit sweep is not a controller. It checks the invariants no single
+	// reconcile can see from the object it is working on — a NAD whose claim is
+	// gone, two claims holding one address, claims stranded by a deleted pool. It
+	// reports by event and writes no status, so it cannot race the reconcilers it
+	// exists to check.
+	if err := mgr.Add(&controller.Auditor{
+		Client:   mgr.GetClient(),
+		Recorder: mgr.GetEventRecorder("cubestack-ipam-audit"),
+	}); err != nil {
+		setupLog.Error(err, "Failed to add audit sweep")
+		os.Exit(1)
+	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "Failed to set up health check")

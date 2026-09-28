@@ -66,7 +66,14 @@ var _ = BeforeSuite(func() {
 
 	By("bootstrapping test environment")
 	testEnv = &envtest.Environment{
-		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		CRDDirectoryPaths: []string{
+			filepath.Join("..", "..", "config", "crd", "bases"),
+			// Minimal CRDs for the two third-party types this project watches:
+			// Multus's NetworkAttachmentDefinition and KubeVirt's VirtualMachine.
+			// Their real CRDs belong to those projects and are far too large to
+			// vendor — see the comments in testdata/.
+			filepath.Join("..", "..", "testdata"),
+		},
 		ErrorIfCRDPathMissing: true,
 	}
 

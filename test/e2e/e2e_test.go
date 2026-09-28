@@ -34,7 +34,7 @@ import (
 )
 
 // namespace where the project is deployed in
-const namespace = "cubestack-ipam-system"
+const namespace = "cubestack-system"
 
 // serviceAccountName created for the project
 const serviceAccountName = "cubestack-ipam-controller-manager"

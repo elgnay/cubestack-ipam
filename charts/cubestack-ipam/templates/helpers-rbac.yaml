@@ -1,0 +1,162 @@
+{{- if and .Values.rbac.create .Values.rbac.helperRoles }}
+{{/*
+  Admin/Editor/Viewer roles for the two CRDs, matching what kubebuilder scaffolds in
+  config/rbac for cluster admins to delegate with. The manager itself uses none of
+  them.
+
+  READ THE CAVEAT BEFORE HANDING THE EDITOR ROLE TO A USER.
+
+  These are ClusterRoles, so an Editor can create an IPRequest in ANY namespace, and
+  an Ippool-Editor can create an IPPool -- which is a cluster-scoped object declaring
+  an address band. For the VM claim flow a tenant needs exactly one thing in their own
+  namespace:
+
+    apiGroups: [ipam.cubestack.io]
+    resources: [iprequests]
+    verbs: [create, get, list, watch]
+
+  Create a namespaced Role + RoleBinding with that instead of binding Editor. The
+  VirtualMachine controller creates the IPRequest on the user's behalf, so a user who
+  never hand-writes claims needs no IPRequest permission at all -- only the ability to
+  set the ipam.cubestack.io/pool annotation on their own VirtualMachine.
+
+  Deleting an IPRequest is the documented escape hatch for moving a VM to a different
+  NAD name, and that is the one thing Editor grants here that the narrow Role above
+  also needs if you want users to self-serve it.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-ippool-viewer-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-ippool-editor-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-ippool-admin-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools
+  verbs:
+  - '*'
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-iprequest-viewer-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-iprequest-editor-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests/status
+  verbs:
+  - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-iprequest-admin-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests
+  verbs:
+  - '*'
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests/status
+  verbs:
+  - get
+{{- end }}

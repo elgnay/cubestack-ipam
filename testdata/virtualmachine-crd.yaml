@@ -1,0 +1,46 @@
+# A minimal VirtualMachine CRD, for envtest only.
+#
+# KubeVirt's real CRD is tens of thousands of lines and none of it matters here:
+# the VirtualMachine controller reads two annotations, sets an ownerReference and
+# never touches the spec at all. What the schema has to allow, therefore, is any
+# spec at all — hence x-kubernetes-preserve-unknown-fields where the real VM spec
+# struct would be.
+#
+# This mirrors how the operator tests third-party types. It is deliberately not a
+# faithful copy, and cannot be: a spec that is preserved verbatim proves only that
+# the controller does not depend on it, which is exactly the property under test.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualmachines.kubevirt.io
+spec:
+  group: kubevirt.io
+  scope: Namespaced
+  names:
+    kind: VirtualMachine
+    listKind: VirtualMachineList
+    plural: virtualmachines
+    singular: virtualmachine
+    shortNames:
+      - vm
+      - vms
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

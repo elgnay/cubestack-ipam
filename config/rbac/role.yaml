@@ -5,25 +5,20 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
-  - ipam.cubestack.io
+  - ""
   resources:
-  - ippools
-  - iprequests
+  - events
   verbs:
   - create
-  - delete
-  - get
-  - list
   - patch
-  - update
-  - watch
 - apiGroups:
   - ipam.cubestack.io
   resources:
-  - ippools/finalizers
-  - iprequests/finalizers
+  - ippools
   verbs:
-  - update
+  - get
+  - list
+  - watch
 - apiGroups:
   - ipam.cubestack.io
   resources:
@@ -34,14 +29,29 @@ rules:
   - patch
   - update
 - apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
   - k8s.cni.cncf.io
   resources:
   - network-attachment-definitions
   verbs:
   - create
-  - delete
   - get
   - list
-  - patch
   - update
+  - watch
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachines
+  verbs:
+  - get
+  - list
   - watch

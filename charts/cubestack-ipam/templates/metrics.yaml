@@ -1,0 +1,106 @@
+{{- if .Values.metrics.enabled }}
+{{/*
+  The metrics endpoint runs with --metrics-secure (the binary's default), so
+  scraping it requires a token that passes a SubjectAccessReview. That is what
+  needs the tokenreviews and subjectaccessreviews grants below.
+
+  All three objects are gated on the same value as the Service and the flag, so
+  the endpoint, its RBAC and the arg that enables it cannot drift apart.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-metrics-auth-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - authentication.k8s.io
+  resources:
+  - tokenreviews
+  verbs:
+  - create
+- apiGroups:
+  - authorization.k8s.io
+  resources:
+  - subjectaccessreviews
+  verbs:
+  - create
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-metrics-auth-rolebinding
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "cubestack-ipam.fullname" . }}-metrics-auth-role
+subjects:
+- kind: ServiceAccount
+  name: {{ include "cubestack-ipam.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+---
+{{/*
+  For whatever scrapes the endpoint. Bind a scraper's ServiceAccount to this
+  ClusterRole to let it read /metrics. It is a nonResourceURL rule because the
+  metrics endpoint is served directly by the manager, not proxied through the API
+  server.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-metrics-reader
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- nonResourceURLs:
+  - "/metrics"
+  verbs:
+  - get
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-metrics
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+spec:
+  ports:
+  - name: https
+    port: {{ .Values.metrics.port }}
+    protocol: TCP
+    targetPort: {{ .Values.metrics.port }}
+  selector:
+    {{- include "cubestack-ipam.selectorLabels" . | nindent 4 }}
+{{- end }}
+{{- if and .Values.metrics.enabled .Values.metrics.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+    {{- with .Values.metrics.serviceMonitor.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "cubestack-ipam.selectorLabels" . | nindent 6 }}
+  endpoints:
+  - port: https
+    scheme: https
+    interval: {{ .Values.metrics.serviceMonitor.interval }}
+    scrapeTimeout: {{ .Values.metrics.serviceMonitor.scrapeTimeout }}
+    # The endpoint requires auth, so a plain scrape gets a 401. Pointing this at a
+    # ServiceAccount bound to <release>-metrics-reader is left to the cluster's
+    # monitoring stack rather than guessed here.
+    bearerTokenFile: /var/run/secrets/kubernetes.io/serviceaccount/token
+    tlsConfig:
+      insecureSkipVerify: true
+{{- end }}

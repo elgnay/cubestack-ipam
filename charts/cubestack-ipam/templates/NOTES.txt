@@ -1,0 +1,61 @@
+cubestack-ipam {{ .Chart.AppVersion }} installed into namespace {{ .Release.Namespace }}.
+
+It is running, but it will not allocate anything until you create an IPPool. The
+pools and claims are the API; this chart only deploys the controllers.
+
+THE IMAGE
+{{- if or (eq (default .Chart.AppVersion .Values.image.tag) "latest") (eq .Values.image.pullPolicy "IfNotPresent") }}
+  Running {{ include "cubestack-ipam.image" . }} with pullPolicy
+  {{ .Values.image.pullPolicy }}. If you did not build that image locally, override it:
+
+    --set image.repository=<registry>/<repo> --set image.tag=<tag> --set image.pullPolicy=Always
+
+  Check the pod if things look quiet:
+    kubectl -n {{ .Release.Namespace }} logs deploy/{{ include "cubestack-ipam.fullname" . }}
+{{- else }}
+  {{ include "cubestack-ipam.image" . }} (pullPolicy {{ .Values.image.pullPolicy }}).
+{{- end }}
+
+NEXT: CREATE A POOL
+  kubectl apply -f https://raw.githubusercontent.com/suanova/cubestack-ipam/main/config/samples/ipam_v1alpha1_ippool.yaml
+
+  Note the plural collision: Whereabouts already owns `ippools` in kube-system, so
+  always use the full resource name.
+
+    kubectl get ippools.ipam.cubestack.io
+
+  Then check the pool was accepted -- some invariants (band ordering, gateway
+  position) are enforced by the controller, not the API server, and a pool that
+  fails them is still admitted:
+
+    kubectl get ippools.ipam.cubestack.io -o jsonpath='{.items[*].status.conditions}'
+
+THEN: TAG A VM
+  Add ipam.cubestack.io/pool: <pool-name> to the VirtualMachine and point its
+  networks[].multus.networkName at the NAD name you want minted
+  (default <vm-name>-static). See config/samples/kubevirt_v1_virtualmachine.yaml.
+
+  The VM will show FailedCreatePodSandBox for the few seconds between being created
+  and its NAD being minted. That is expected and self-healing.
+
+WHAT THIS DOES NOT DO
+  It does not configure the guest, and it does not migrate existing VMs onto claims.
+  The shared underlay NAD is not touched by this chart -- retiring it is a migration,
+  not a deploy. See the README.
+
+{{- if .Values.metrics.enabled }}
+
+METRICS
+  HTTPS on port {{ .Values.metrics.port }}, requiring a bearer token that passes a
+  SubjectAccessReview. To scrape it, bind your scraper's ServiceAccount:
+
+    kubectl create clusterrolebinding <name> \\
+      --clusterrole={{ include "cubestack-ipam.fullname" . }}-metrics-reader \\
+      --serviceaccount=<ns>:<sa>
+
+  A plain `curl` of /metrics returns 401 by design. To read it by hand:
+
+    kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "cubestack-ipam.fullname" . }}-metrics {{ .Values.metrics.port }}:{{ .Values.metrics.port }}
+    curl -k -H "Authorization: Bearer $(kubectl create token <sa> -n <ns>)" \\
+      https://localhost:{{ .Values.metrics.port }}/metrics
+{{- end }}

@@ -1,5 +1,17 @@
 ## Append samples of your project ##
+#
+# The IPRequest sample is the hand-written form of what the VirtualMachine sample
+# produces automatically. Apply one or the other, not both: they claim the same
+# NAD name, and the second would fail as NADNameTaken.
+#
+# ipam_v1alpha1_ippool_minimal.yaml is deliberately NOT listed here. It is the
+# alternative form of a pool -- a band with no nadTemplate -- and it carries the
+# same range as cubestack-static-v4. Two pools over one band is the
+# misconfiguration the README warns about: each allocates against its own PoolRef
+# and would happily hand the same address to two claims. Use it instead of the
+# full pool, not alongside it.
 resources:
 - ipam_v1alpha1_ippool.yaml
 - ipam_v1alpha1_iprequest.yaml
+- kubevirt_v1_virtualmachine.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

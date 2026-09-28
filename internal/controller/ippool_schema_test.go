@@ -24,6 +24,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/yaml"
 
@@ -47,10 +48,12 @@ var _ = Describe("IPPool schema validation", func() {
 
 	newPool := func(mutate func(*ipamv1alpha1.IPPoolSpec)) *ipamv1alpha1.IPPool {
 		spec := ipamv1alpha1.IPPoolSpec{
-			Subnet:      "10.66.3.0/24",
-			Range:       ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
-			Gateway:     "10.66.3.254",
-			TemplateNAD: "default/vm-underlay-10-66-3-0",
+			Range: ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
+			NADTemplate: &ipamv1alpha1.NADTemplate{
+				Subnet:  "10.66.3.0/24",
+				Gateway: "10.66.3.254",
+				Bridge:  "br0",
+			},
 		}
 		mutate(&spec)
 		return &ipamv1alpha1.IPPool{
@@ -71,11 +74,11 @@ var _ = Describe("IPPool schema validation", func() {
 		})
 		err := k8sClient.Create(ctx, pool)
 		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("must lie within subnet"))
+		Expect(err.Error()).To(ContainSubstring("must lie within the nadTemplate subnet"))
 	})
 
 	It("rejects a gateway that is not an address", func() {
-		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.Gateway = "not-an-ip" })
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate.Gateway = "not-an-ip" })
 		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
 	})
 
@@ -83,6 +86,65 @@ var _ = Describe("IPPool schema validation", func() {
 		ipReq := &ipamv1alpha1.IPRequest{
 			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
 			Spec:       ipamv1alpha1.IPRequestSpec{},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).NotTo(Succeed())
+	})
+
+	// The minimal form: a band and nothing else. Nothing mints from this pool, so
+	// it needs no subnet and no gateway, and the CRD must not demand them.
+	It("accepts a pool with no nadTemplate", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate = nil })
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pool) })
+	})
+
+	// A pool must declare a usable band; it is the one field with no default. (The
+	// typed client always serialises range, so this exercises the bound patterns
+	// rather than the required-ness of the field itself.)
+	It("rejects a pool whose range bounds are empty", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.Range = ipamv1alpha1.IPRange{} })
+		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
+	})
+
+	// The nadTemplate is typed precisely so that this class of mistake is caught
+	// here instead of surfacing as a VM stuck in FailedCreatePodSandBox. Subnet and
+	// gateway are required for the same reason: a template is all-or-nothing, which
+	// is what removes the need for a cross-field rule saying so.
+	It("rejects a nadTemplate with no bridge", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate.Bridge = "" })
+		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
+	})
+
+	It("rejects a nadTemplate with no subnet", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate.Subnet = "" })
+		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
+	})
+
+	It("rejects a nadTemplate with no gateway", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate.Gateway = "" })
+		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
+	})
+
+	It("rejects a subnet that is not a CIDR", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate.Subnet = "10.66.3.0" })
+		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
+	})
+
+	It("rejects a VLAN outside the 802.1Q range", func() {
+		vlan := int32(9999)
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate.VLAN = &vlan })
+		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
+	})
+
+	It("rejects an unknown CNI plugin type", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) { s.NADTemplate.Type = "sriov" })
+		Expect(k8sClient.Create(ctx, pool)).NotTo(Succeed())
+	})
+
+	It("rejects an IPRequest whose nad is not a DNS subdomain", func() {
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec:       ipamv1alpha1.IPRequestSpec{PoolRef: "any", NAD: "Not_A_Name"},
 		}
 		Expect(k8sClient.Create(ctx, ipReq)).NotTo(Succeed())
 	})
@@ -97,7 +159,9 @@ var _ = Describe("Shipped samples", func() {
 
 	for _, path := range []string{
 		"../../config/samples/ipam_v1alpha1_ippool.yaml",
+		"../../config/samples/ipam_v1alpha1_ippool_minimal.yaml",
 		"../../config/samples/ipam_v1alpha1_iprequest.yaml",
+		"../../config/samples/kubevirt_v1_virtualmachine.yaml",
 	} {
 		It("satisfies the schema: "+path, func() {
 			raw, err := os.ReadFile(path)
@@ -109,6 +173,12 @@ var _ = Describe("Shipped samples", func() {
 				obj = &ipamv1alpha1.IPPool{}
 			case strings.Contains(string(raw), "kind: IPRequest"):
 				obj = &ipamv1alpha1.IPRequest{}
+			case strings.Contains(string(raw), "kind: VirtualMachine"):
+				// Unstructured because the VM is a third-party type this project
+				// does not vendor — see testdata/virtualmachine-crd.yaml.
+				vm := &unstructured.Unstructured{}
+				vm.SetGroupVersionKind(virtualMachineGVK)
+				obj = vm
 			default:
 				Fail("unrecognised sample kind in " + path)
 			}

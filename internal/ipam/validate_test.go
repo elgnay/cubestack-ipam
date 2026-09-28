@@ -23,19 +23,21 @@ import (
 	ipamv1alpha1 "github.com/suanova/cubestack-ipam/api/v1alpha1"
 )
 
-func TestValidatePoolRange(t *testing.T) {
-	// The band the design proposes for 10.66.3.0/24 (design §5.4), which is
-	// disjoint from the Whereabouts window (.200-.220) and the MetalLB pool
-	// (.221-.240). Disjointness itself is not checkable from this object.
-	validSpec := func() ipamv1alpha1.IPPoolSpec {
-		return ipamv1alpha1.IPPoolSpec{
-			Subnet:      "10.66.3.0/24",
-			Range:       ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
-			Gateway:     "10.66.3.254",
-			TemplateNAD: "default/vm-underlay-10-66-3-0",
-		}
+// validSpec is a minting pool: the band the design proposes for 10.66.3.0/24
+// (design §5.4), which is disjoint from the Whereabouts window (.200-.220) and the
+// MetalLB pool (.221-.240). Disjointness itself is not checkable from this object.
+func validSpec() ipamv1alpha1.IPPoolSpec {
+	return ipamv1alpha1.IPPoolSpec{
+		Range: ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
+		NADTemplate: &ipamv1alpha1.NADTemplate{
+			Subnet:  "10.66.3.0/24",
+			Gateway: "10.66.3.254",
+			Bridge:  "br0",
+		},
 	}
+}
 
+func TestValidatePoolRange(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(*ipamv1alpha1.IPPoolSpec)
@@ -66,7 +68,7 @@ func TestValidatePoolRange(t *testing.T) {
 		{
 			name: "gateway inside the range",
 			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
-				s.Gateway = "10.66.3.160"
+				s.NADTemplate.Gateway = "10.66.3.160"
 			},
 			wantErr: "must not fall inside",
 		},
@@ -74,15 +76,25 @@ func TestValidatePoolRange(t *testing.T) {
 			// Boundary: a gateway equal to a bound is still inside.
 			name: "gateway equal to range start",
 			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
-				s.Gateway = "10.66.3.150"
+				s.NADTemplate.Gateway = "10.66.3.150"
 			},
 			wantErr: "must not fall inside",
 		},
 		{
 			name: "gateway above the range is fine",
 			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
-				s.Gateway = "10.66.3.190"
+				s.NADTemplate.Gateway = "10.66.3.190"
 			},
+		},
+		{
+			// The check that only appeared once the gateway was known to have to be
+			// on-link: outside the band (so the range check passes) but in another
+			// subnet entirely, which a bridge binding cannot reach.
+			name: "gateway outside the subnet",
+			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
+				s.NADTemplate.Gateway = "10.66.9.254"
+			},
+			wantErr: "must lie within subnet",
 		},
 		{
 			// Lower than end, so containment is the only rule this can trip —
@@ -103,7 +115,7 @@ func TestValidatePoolRange(t *testing.T) {
 		{
 			name: "subnet is not a CIDR",
 			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
-				s.Subnet = "10.66.3.0"
+				s.NADTemplate.Subnet = "10.66.3.0"
 			},
 			wantErr: "not a valid CIDR",
 		},
@@ -117,12 +129,30 @@ func TestValidatePoolRange(t *testing.T) {
 		{
 			name: "IPv6 is rejected",
 			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
-				s.Subnet = "fd00::/64"
+				s.NADTemplate.Subnet = "fd00::/64"
+				s.NADTemplate.Gateway = "fd00::ffff"
 				s.Range.Start = "fd00::1"
 				s.Range.End = "fd00::10"
-				s.Gateway = "fd00::ffff"
 			},
 			wantErr: "IPv4-only",
+		},
+
+		// A template that is present but incomplete. The CRD requires these fields,
+		// but the function must still cope: a CRD update admits objects the previous
+		// schema would have rejected, and those reach the reconciler unchanged.
+		{
+			name: "template with no subnet",
+			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
+				s.NADTemplate.Subnet = ""
+			},
+			wantErr: "nadTemplate.subnet is required",
+		},
+		{
+			name: "template with no gateway",
+			mutate: func(s *ipamv1alpha1.IPPoolSpec) {
+				s.NADTemplate.Gateway = ""
+			},
+			wantErr: "nadTemplate.gateway is required",
 		},
 	}
 
@@ -144,21 +174,79 @@ func TestValidatePoolRange(t *testing.T) {
 	}
 }
 
+// A pool with no nadTemplate allocates addresses and mints nothing, so it has no
+// subnet and no gateway to be incoherent. This is the minimal form of the API:
+// spec.range is the only required field, and for a ledger-only pool it is the only
+// field at all.
+func TestValidatePoolRange_LedgerOnly(t *testing.T) {
+	ledgerOnly := func() ipamv1alpha1.IPPoolSpec {
+		return ipamv1alpha1.IPPoolSpec{
+			Range: ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
+		}
+	}
+
+	t.Run("a bare band is valid", func(t *testing.T) {
+		if err := ValidatePoolRange(ledgerOnly()); err != nil {
+			t.Fatalf("a pool with only a range should be valid: %v", err)
+		}
+	})
+
+	t.Run("a single-address band is valid", func(t *testing.T) {
+		spec := ledgerOnly()
+		spec.Range.End = spec.Range.Start
+		if err := ValidatePoolRange(spec); err != nil {
+			t.Fatalf("a single-address ledger-only pool should be valid: %v", err)
+		}
+	})
+
+	// Having no template excuses the pool from gateway and subnet checks — not from
+	// being a coherent band, which is the one thing it still has to be.
+	t.Run("a reversed band is still rejected", func(t *testing.T) {
+		spec := ledgerOnly()
+		spec.Range.Start, spec.Range.End = spec.Range.End, spec.Range.Start
+		if err := ValidatePoolRange(spec); err == nil {
+			t.Fatal("expected a reversed range to be rejected")
+		}
+	})
+
+	t.Run("a malformed bound is still rejected", func(t *testing.T) {
+		spec := ledgerOnly()
+		spec.Range.End = "not-an-ip"
+		if err := ValidatePoolRange(spec); err == nil {
+			t.Fatal("expected a malformed range.end to be rejected")
+		}
+	})
+
+	t.Run("an IPv6 band is still rejected", func(t *testing.T) {
+		spec := ledgerOnly()
+		spec.Range.Start = "fd00::1"
+		spec.Range.End = "fd00::10"
+		err := ValidatePoolRange(spec)
+		if err == nil || !strings.Contains(err.Error(), "IPv4-only") {
+			t.Fatalf("expected an IPv4-only error, got: %v", err)
+		}
+	})
+}
+
 // The design's own pools must pass, or the defaults in config/samples are wrong.
 func TestValidatePoolRange_DesignSamples(t *testing.T) {
 	for _, spec := range []ipamv1alpha1.IPPoolSpec{
 		{
-			Subnet:      "10.66.3.0/24",
-			Range:       ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
-			Gateway:     "10.66.3.254",
-			TemplateNAD: "default/vm-underlay-10-66-3-0",
+			Range: ipamv1alpha1.IPRange{Start: "10.66.3.150", End: "10.66.3.189"},
+			NADTemplate: &ipamv1alpha1.NADTemplate{
+				Subnet:  "10.66.3.0/24",
+				Gateway: "10.66.3.254",
+				Bridge:  "br0",
+			},
 		},
 		{
 			// The user guide's alternative band (design R5 notes the docs disagree).
-			Subnet:      "10.66.3.0/24",
-			Range:       ipamv1alpha1.IPRange{Start: "10.66.3.181", End: "10.66.3.199"},
-			Gateway:     "10.66.3.254",
-			TemplateNAD: "default/vm-underlay-10-66-3-0",
+			Range: ipamv1alpha1.IPRange{Start: "10.66.3.181", End: "10.66.3.199"},
+			NADTemplate: &ipamv1alpha1.NADTemplate{
+				Subnet:  "10.66.3.0/24",
+				Gateway: "10.66.3.254",
+				Bridge:  "br0",
+			},
 		},
 	} {
 		if err := ValidatePoolRange(spec); err != nil {

@@ -18,78 +18,87 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	ipamv1alpha1 "github.com/suanova/cubestack-ipam/api/v1alpha1"
 	"github.com/suanova/cubestack-ipam/internal/ipam"
 )
 
-// IPPoolReconciler reconciles a IPPool object.
+// IPPoolReconciler reconciles an IPPool.
 //
-// THIS IS A STUB. It reads the object and logs it, and does nothing else. The
-// design (kubevirt-vm-static-ip-design.md) requires the spikes in §8 to run
-// before any of this is implemented — see the README.
+// Its whole job is to answer one question: is this pool usable as written? The
+// answer goes in status.conditions and nowhere else. In particular there is no
+// ledger of allocated addresses here — the set of IPRequests is the only
+// authoritative record of who holds what, and a second list would be a second
+// thing to keep in step.
+//
+// The pool's other declared invariant — that its band is disjoint from any other
+// NAD serving the same subnet — is deliberately NOT checked. With the shared
+// underlay NAD retired, there is no longer a live object to compare against, and
+// the remaining overlap risk (an admin hand-writing a conflicting NAD) is bounded
+// by RBAC instead: regular users cannot create NADs. What cannot be caught before
+// the fact is caught after it, by the audit sweep.
 type IPPoolReconciler struct {
 	client.Client
 	Scheme *runtime.Scheme
 }
 
-// +kubebuilder:rbac:groups=ipam.cubestack.io,resources=ippools,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=ipam.cubestack.io,resources=ippools/status,verbs=get;update;patch
-// +kubebuilder:rbac:groups=ipam.cubestack.io,resources=ippools/finalizers,verbs=update
+// +kubebuilder:rbac:groups=ipam.cubestack.io,resources=ippools,verbs=get;list;watch
+// +kubebuilder:rbac:groups=ipam.cubestack.io,resources=ippools/status,verbs=get;patch;update
 
-// Reconcile is part of the main kubernetes reconciliation loop which aims to
-// move the current state of the cluster closer to the desired state.
+// Reconcile validates a pool and publishes the result.
 //
-// NOT YET IMPLEMENTED — the intended responsibilities, from design §5.5:
-//
-//   - Verify templateNAD resolves to an existing NetworkAttachmentDefinition.
-//     Without it a generated per-VM NAD cannot be templated, and every IPRequest
-//     against this pool will fail at pod-sandbox time rather than here.
-//
-//   - Audit pool placement (design R5): the range must be disjoint from the
-//     Whereabouts dynamic window AND from the MetalLB pool on the same subnet.
-//     Neither is visible from this object, so the check has to read the template
-//     NAD's effective IPAM config. Getting this wrong produces silent duplicate
-//     allocation — the failure mode is a VM that boots with someone else's address.
-//
-//   - Report both outcomes via status.conditions.
-//
-// Deliberately no status ledger of allocated addresses: the set of IPRequests is
-// the single source of truth (design §R3), and a second list would drift.
-//
-// For more details, check Reconcile and its Result here:
-// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.25.0/pkg/reconcile
+// No requeue on any outcome. Nothing here is time-dependent, so the next change
+// arrives as a watch event: the pool itself, or — through the IPRequest
+// controller's watch on IPPool — the claims that depend on this verdict.
 func (r *IPPoolReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := logf.FromContext(ctx)
-
 	pool := &ipamv1alpha1.IPPool{}
 	if err := r.Get(ctx, req.NamespacedName, pool); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	original := pool.DeepCopy()
+
+	available := metav1.Condition{
+		Type:               ipamv1alpha1.ConditionAvailable,
+		Status:             metav1.ConditionTrue,
+		Reason:             ipamv1alpha1.ReasonRangeValid,
+		ObservedGeneration: pool.Generation,
+	}
+	// A pool with no template mints nothing, so naming a subnet in the message
+	// would point at a field the pool does not have.
+	if tmpl := pool.Spec.NADTemplate; tmpl != nil {
+		available.Message = fmt.Sprintf("range %s-%s in subnet %s is allocatable", pool.Spec.Range.Start, pool.Spec.Range.End, tmpl.Subnet)
+	} else {
+		available.Message = fmt.Sprintf("range %s-%s is allocatable", pool.Spec.Range.Start, pool.Spec.Range.End)
+	}
 	if err := ipam.ValidatePoolRange(pool.Spec); err != nil {
 		// The CRD schema catches containment but cannot catch IP ordering, because
-		// the CEL net library has no ordering overload on IP values.
-		// TODO(design §5.5): surface this as a status condition rather than a log line.
-		log.Error(err, "IPPool spec failed validation")
+		// the CEL net library has no ordering overload on IP values. This is where
+		// that gap is closed, and the gap is visible to users only through this
+		// condition — a pool that fails here is still accepted by the API server.
+		available.Status = metav1.ConditionFalse
+		available.Reason = ipamv1alpha1.ReasonRangeInvalid
+		available.Message = err.Error()
 	}
+	apimeta.SetStatusCondition(&pool.Status.Conditions, available)
 
-	log.Info("reconciled IPPool; audit not implemented yet",
-		"subnet", pool.Spec.Subnet,
-		"range", pool.Spec.Range.Start+"-"+pool.Spec.Range.End,
-		"gateway", pool.Spec.Gateway,
-		"templateNAD", pool.Spec.TemplateNAD,
-	)
-
-	return ctrl.Result{}, nil
+	return ctrl.Result{}, patchStatusIfChanged(ctx, r.Client, original, pool, original.Status, pool.Status)
 }
 
 // SetupWithManager sets up the controller with the Manager.
+//
+// There is deliberately no watch on IPRequest here. A claim's lifecycle changes
+// nothing about whether its pool is usable, so mapping claims to this controller
+// would buy nothing and cost a reconcile of the pool on every claim in the
+// cluster. The dependency runs the other way, and is handled on the other side:
+// see IPRequestReconciler.claimsForPool.
 func (r *IPPoolReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&ipamv1alpha1.IPPool{}).

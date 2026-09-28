@@ -7,20 +7,63 @@ metadata:
   name: cubestack-static-v4
 spec:
   # Cluster-scoped: an admin creates this, users claim from it.
-  subnet: 10.66.3.0/24
-
-  # The design's proposed band (design §5.4). It must be disjoint from BOTH the
-  # Whereabouts dynamic window (.200-.220) and the MetalLB pool (.221-.240).
   #
-  # CAUTION: the source documents disagree about the 10.66.2.0/24 dynamic window
-  # and about the intended 10.66.3.0/24 static band -- see the README table. Verify
-  # against the live NAD before using this sample anywhere real:
-  #   kubectl get nad -n default vm-underlay-10-66-3-0 -o jsonpath='{.spec.config}'
+  # range is the ONLY required field. It is what the allocator needs; everything
+  # the minted network config needs lives in nadTemplate below, and is required
+  # only when that template is present. A pool with no nadTemplate allocates
+  # addresses and mints nothing, so it needs no subnet and no gateway -- see
+  # ipam_v1alpha1_ippool_minimal.yaml.
+  #
+  # The band must be disjoint from any other NAD serving the same subnet. That is
+  # an admin responsibility rather than a controller check: regular users cannot
+  # create NADs, so an overlap can only be introduced deliberately, by an admin.
+  # Once the shared vm-underlay-10-66-3-0 NAD is retired, this pool is the only
+  # thing serving the space and there is nothing left for it to overlap with.
+  #
+  # MetalLB is NOT installed on this cluster (no CRDs, no namespace, verified
+  # 2026-09-28), so there is no MetalLB pool to avoid. If it is ever installed on
+  # this subnet, this band has to be re-checked against it.
+  #
+  # .221-.240 sits immediately above the shared vm-underlay-10-66-3-0 NAD's
+  # dynamic window (.200-.220), so the two cannot contend: Whereabouts hands out
+  # .200-.220 to dynamically-addressed pods and this pool hands out .221-.240 to
+  # claims, out of the same 10.66.3.0/24 ledger. Both bands are disjoint from the
+  # ledger's eight existing allocations, all in .200-.208.
+  #
+  # The design originally proposed .150-.189 for this subnet; this band replaces
+  # it to sit hard against the dynamic window rather than leaving a gap.
   range:
-    start: 10.66.3.150
-    end: 10.66.3.189
+    start: 10.66.3.221
+    end: 10.66.3.240
 
-  gateway: 10.66.3.254
+  # Optional: everything the per-VM NADs should contain. Present means this pool
+  # mints networks; a claim that asks for a NAD against a pool without one fails
+  # with a TemplateMissing condition rather than binding without a network.
+  #
+  # All three of subnet, gateway and bridge are required here whenever nadTemplate
+  # is set. A template is therefore all-or-nothing, which is also why there is no
+  # rule anywhere saying so -- the field list is the rule.
+  #
+  # These are the values the shared vm-underlay-10-66-3-0 NAD carried. Nothing
+  # reads that NAD any more; they live here now so the pool describes the underlay
+  # by itself.
+  nadTemplate:
+    # The CIDR the minted NADs draw from -- it becomes ipam.range, which in a CNI
+    # config is what selects the Whereabouts allocation ledger. NOT the allocatable
+    # band: that is range above, which must lie inside this subnet. Several pools
+    # may share one subnet as long as their bands are disjoint.
+    subnet: 10.66.3.0/24
 
-  # Bridge, routes and DNS are cloned from this NAD into each per-VM NAD.
-  templateNAD: default/vm-underlay-10-66-3-0
+    # The default gateway. Must be inside subnet (a bridge binding needs it on the
+    # same L2) and outside range above.
+    gateway: 10.66.3.254
+
+    type: cnv-bridge
+    bridge: br0
+    macspoofchk: false
+    dns:
+      nameservers:
+        - 223.5.5.5
+        - 8.8.8.8
+    routes:
+      - dst: 0.0.0.0/0

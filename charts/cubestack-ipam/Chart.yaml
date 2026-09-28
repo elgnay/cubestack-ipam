@@ -1,0 +1,33 @@
+apiVersion: v2
+name: cubestack-ipam
+description: |
+  Static, claimable underlay IP addresses for KubeVirt VMs on a Multus + Whereabouts
+  network. Mints a per-VM single-address NetworkAttachmentDefinition per claim so the
+  guest can stay on plain DHCP and still keep its address across a restart.
+type: application
+
+# version is the chart's own version; appVersion is the default image tag. Bump
+# `version` for any chart change, `appVersion` when the image moves.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords:
+  - kubevirt
+  - whereabouts
+  - multus
+  - ipam
+  - networking
+
+home: https://github.com/suanova/cubestack-ipam
+sources:
+  - https://github.com/suanova/cubestack-ipam
+
+maintainers:
+  - name: suanova
+
+# The controller talks to exactly two APIs beyond its own CRDs: Multus's
+# NetworkAttachmentDefinition and KubeVirt's VirtualMachine. Both are watched
+# unstructured, so neither is a Go dependency -- but neither is optional at
+# runtime. See the README.
+annotations:
+  category: Networking

@@ -1,0 +1,93 @@
+{{- if .Values.rbac.create }}
+{{/*
+  GENERATED PERMISSIONS -- DO NOT HAND-EDIT.
+
+  This rule set is copied verbatim from config/rbac/role.yaml, which controller-gen
+  produces from the +kubebuilder:rbac markers in internal/controller/*.go. If the
+  controller needs a new verb, add the marker and run `make manifests`, then re-copy
+  the result here. Editing this file directly creates a permission the markers do not
+  know about, which `make manifests` will silently not reproduce.
+
+  Two things about this set are deliberate and easy to "fix" wrongly:
+
+    - There is NO delete on anything. Every object the controller creates is released
+      by garbage collection walking VM -> IPRequest -> NAD, so it never needs to
+      delete. The RBAC is the boundary that keeps that true.
+    - network-attachment-definitions has create/get/list/update/watch but no delete,
+      and virtualmachines is read-only. The controller is create-only with respect to
+      VirtualMachines and never adopts a NAD it did not create.
+*/}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-manager-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - ippools/status
+  - iprequests/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprequests
+  verbs:
+  - create
+  - get
+  - list
+  - watch
+- apiGroups:
+  - k8s.cni.cncf.io
+  resources:
+  - network-attachment-definitions
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - kubevirt.io
+  resources:
+  - virtualmachines
+  verbs:
+  - get
+  - list
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-manager-rolebinding
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "cubestack-ipam.fullname" . }}-manager-role
+subjects:
+- kind: ServiceAccount
+  name: {{ include "cubestack-ipam.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}

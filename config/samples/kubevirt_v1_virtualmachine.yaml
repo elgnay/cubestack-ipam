@@ -1,0 +1,130 @@
+apiVersion: kubevirt.io/v1
+kind: VirtualMachine
+metadata:
+  name: cubestack6
+  namespace: default
+  labels:
+    # Cluster convention, used for per-owner querying and cleanup:
+    #   kubectl get vm -l owner=<username>
+    # Must be a legal label value -- no angle brackets.
+    owner: change-me
+  annotations:
+    # The trigger. A VirtualMachine without this annotation is left alone entirely.
+    #
+    # Controller #2 reads it and creates an IPRequest named <vm-name>-ip in this
+    # namespace, owned by this VM. Controller #1 then allocates an address and
+    # mints the NAD named below. Neither controller ever patches the VM.
+    ipam.cubestack.io/pool: cubestack-static-v4
+
+    # Optional. The NAD to mint; it defaults to <vm-name>-static, which is
+    # "cubestack6-static" here. Set it only when you want a different name.
+    ipam.cubestack.io/nad-name: cubestack6-static
+spec:
+  runStrategy: Always
+  dataVolumeTemplates:
+    # Root-disk PVC names must be unique within the namespace: this becomes the
+    # PVC name verbatim.
+    - metadata:
+        name: cubestack6-rootdisk
+      spec:
+        source:
+          pvc:
+            name: ubuntu-22.04-server-amd64-img
+            namespace: default
+        storage:
+          # RWX + Block, not because of migration -- that is off the table above --
+          # but because it is what makes the disk independent of the node: the VM
+          # can be stopped and started elsewhere, and an unplanned node loss does
+          # not take the data with it. Block mode also skips the filesystem layer
+          # KubeVirt does not need here.
+          accessModes:
+            - ReadWriteMany
+          storageClassName: ceph-rbd-kubevirt
+          volumeMode: Block
+          resources:
+            requests:
+              storage: 20Gi
+  template:
+    metadata:
+      labels:
+        kubevirt.io/domain: cubestack6
+    spec:
+      # Required for a static-IP VM, and not as a preference. A per-VM NAD pins one
+      # address via range_start == range_end, but live migration brings the target
+      # pod up *while the source pod is still serving*, so both need that same
+      # address at once. Whereabouts refuses the second CNI ADD and the migration
+      # hangs in Scheduling forever (measured 2026-09-28: "Could not allocate IP in
+      # range: ip: 10.66.3.221 / - 10.66.3.221"). With the default (LiveMigrate)
+      # KubeVirt offers the VM for migration on every node drain and every eviction,
+      # and those offers fail; the VM is then movable only by stopping and starting
+      # it. It sits under template.spec, NOT at spec.evictionStrategy -- KubeVirt's
+      # CRD is structural, so a wrong field name is silently pruned by the apiserver
+      # rather than rejected, and you get no warning at all.
+      evictionStrategy: None
+      # Which subnet the VM lands in is decided by the multus networkName below,
+      # and the nodeSelector has to agree with it or scheduling fails. Only
+      # 10-66-3-46/47 carry this label.
+      nodeSelector:
+        kubevirt.io/subnet: 10-66-3-0
+      domain:
+        cpu:
+          cores: 4
+        # Required. KubeVirt's admission webhook rejects a VMI with no memory
+        # declared -- one of spec.domain.memory.guest,
+        # spec.domain.memory.hugepages.pageSize or
+        # spec.domain.resources.requests.memory must be set.
+        resources:
+          requests:
+            memory: 8Gi
+        devices:
+          disks:
+            - disk:
+                bus: virtio
+              name: rootdisk
+            - disk:
+                bus: virtio
+              name: cloudinitdisk
+          interfaces:
+            # The name here is local to this manifest; the reference that matters
+            # is networks[].multus.networkName below.
+            - name: underlay
+              bridge: {}
+      networks:
+        - name: underlay
+          multus:
+            # Must match ipam.cubestack.io/nad-name, or the default <vm-name>-static.
+            # Multus resolves this at pod-sandbox creation, so the VM will sit in
+            # FailedCreatePodSandBox for the few seconds until the claim has minted
+            # it. That is expected, not a failure to investigate.
+            networkName: default/cubestack6-static
+      volumes:
+        - name: rootdisk
+          dataVolume:
+            name: cubestack6-rootdisk
+        - name: cloudinitdisk
+          cloudInitNoCloud:
+            userData: |
+              #cloud-config
+              users:
+                - name: ubuntu
+                  sudo: ALL=(ALL) NOPASSWD:ALL
+                  shell: /bin/bash
+                  lock_passwd: false
+                  # NOT plaintext -- a crypt hash. macOS:
+                  #   openssl passwd -1 '<pw>'   (LibreSSL has no -6)
+                  # Linux: openssl passwd -6 '<pw>'. Quote it: the hash contains $.
+                  passwd: "<hash>"
+              ssh_pwauth: true
+              chpasswd:
+                expire: false
+            # The NAD's DNS does NOT reach the guest -- the interface is on DHCP,
+            # which KubeVirt answers on the virt-launcher side, but nameservers
+            # have to be declared here or the VM has no DNS.
+            networkData: |
+              version: 2
+              ethernets:
+                all-en:
+                  match: { name: "en*" }
+                  dhcp4: true
+                  nameservers:
+                    addresses: [223.5.5.5, 8.8.8.8]

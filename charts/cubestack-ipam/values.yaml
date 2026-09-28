@@ -1,0 +1,109 @@
+# Default values for cubestack-ipam.
+#
+# There is no published image yet, so these defaults match what `make docker-build`
+# produces (IMG ?= controller:latest). Build the image, get it onto the nodes -- for
+# kind, `kind load docker-image controller:latest` -- and the chart installs as-is.
+# Any real deployment must override both: see the README.
+
+image:
+  repository: controller
+  # Defaults to .Chart.AppVersion when empty.
+  tag: latest
+  # IfNotPresent suits a locally-loaded image, which is how this is most likely to be
+  # run first. Switch to Always if you tag immutably and pull from a registry.
+  pullPolicy: IfNotPresent
+
+# The manager holds a leader-election lease, so more than one replica is a
+# supported HA configuration -- the audit sweep and both controllers are
+# leader-gated. The lease ID is fixed in the binary (e0485e51.cubestack.io), so
+# two releases in the SAME namespace would contend for one lease and only one
+# would run. Two releases in different namespaces are independent.
+replicaCount: 1
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# Leader election. Leave on for anything but a single-replica dev install: the
+# audit sweep is a leader-gated Runnable, and without a lease every replica would
+# sweep and emit duplicate Warning events.
+leaderElection:
+  enabled: true
+
+# Create the namespace. Set false if you are installing into a namespace that
+# already exists and contains other things -- helm install -n <ns> --create-namespace
+# is usually a better answer.
+namespace:
+  create: true
+
+# RBAC for the manager itself. Leave on unless you manage these bindings
+# out-of-band (GitOps that owns all ClusterRoles, a policy engine, etc.).
+rbac:
+  create: true
+  # The scaffolded Admin/Editor/Viewer ClusterRoles for the two CRDs. They grant
+  # cluster-wide access, which is broader than a tenant needs -- see the README
+  # before handing them out.
+  helperRoles: true
+
+serviceAccount:
+  # Set false to reuse an existing ServiceAccount; name is then required.
+  create: true
+  name: ""
+  annotations: {}
+
+# The metrics endpoint. On by default, matching `config/default` in the kustomize
+# tree, and secured: the endpoint is HTTPS on 8443 and requires a bearer token
+# that passes a SubjectAccessReview. Turning this off drops the Service, the arg
+# and the two auth ClusterRoles together, so the three cannot disagree.
+metrics:
+  enabled: true
+  port: 8443
+  # Requires the Prometheus Operator. config/prometheus in the kustomize tree is
+  # commented out by default for the same reason.
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}
+
+podAnnotations: {}
+podLabels: {}
+
+# Matches the sandboxing in the kustomize manifest. The manager needs no
+# privileges and no writable filesystem, so these are worth keeping.
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  readOnlyRootFilesystem: true
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+livenessProbe:
+  initialDelaySeconds: 15
+  periodSeconds: 20
+
+readinessProbe:
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# The manager is Linux-only (Distroless static). On a mixed-architecture cluster
+# build with `make docker-buildx` rather than restricting the node pool.
+# nodeSelector:
+#   kubernetes.io/os: linux

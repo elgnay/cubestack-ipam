@@ -34,10 +34,17 @@ import (
 // remains the actual allocation primitive; this type is the operator-facing
 // declaration of intent, not a second IPAM implementation.
 //
-// The range MUST be disjoint from the Whereabouts dynamic window and from the
-// MetalLB pool on the same subnet. That invariant cannot be checked from inside
-// this object — the reconciler is expected to audit it against the referenced
-// NAD (design §5.5).
+// The fields divide along one line: spec.range is what the ALLOCATOR needs, and
+// spec.nadTemplate is what the CNI needs. That is why range is the only required
+// field — a pool that never mints a NAD only allocates, so it never needs a
+// subnet or a gateway. Everything the minted config contains lives in the
+// template, and is required exactly when the template is present.
+//
+// The range MUST be disjoint from any other NAD serving the same subnet, and
+// from the MetalLB pool if one exists on it. That is an admin responsibility
+// rather than a controller check: with the shared underlay NAD retired, there is
+// no longer a live object to audit against, and regular users cannot create
+// NADs. See the README.
 //
 // Only the two containment rules below are CEL: the Kubernetes CEL net library
 // exposes cidr(...).containsIP(ip(...)) but defines NO ordering overload on IP
@@ -45,32 +52,123 @@ import (
 // expressible as schema rules however they are written. They are enforced in Go
 // instead — see ipam.ValidatePoolRange, which the reconciler calls.
 //
-// +kubebuilder:validation:XValidation:rule="cidr(self.subnet).containsIP(ip(self.range.start))",message="range.start must lie within subnet"
-// +kubebuilder:validation:XValidation:rule="cidr(self.subnet).containsIP(ip(self.range.end))",message="range.end must lie within subnet"
+// +kubebuilder:validation:XValidation:rule="!has(self.nadTemplate) || cidr(self.nadTemplate.subnet).containsIP(ip(self.range.start))",message="range.start must lie within the nadTemplate subnet"
+// +kubebuilder:validation:XValidation:rule="!has(self.nadTemplate) || cidr(self.nadTemplate.subnet).containsIP(ip(self.range.end))",message="range.end must lie within the nadTemplate subnet"
 type IPPoolSpec struct {
-	// subnet is the CIDR this pool's addresses are drawn from, e.g. "10.66.3.0/24".
+	// range is the inclusive band of addresses available to IPRequest claims.
+	// It must not overlap any other NAD serving the same subnet. Regular users
+	// cannot create NADs, so this is an admin responsibility rather than something
+	// the controller can observe — see the README.
+	//
+	// This is the only required field. A pool with no nadTemplate allocates
+	// addresses and mints nothing, so it needs no subnet and no gateway.
+	// +required
+	Range IPRange `json:"range"`
+
+	// nadTemplate is the network config cloned into every NAD this pool mints,
+	// including the addressing that config carries.
+	//
+	// Optional, because a pool need not serve claims that ask for a NAD. A claim
+	// that sets IPRequest.spec.nad against a pool with no template fails with a
+	// TemplateMissing condition rather than silently binding without a network.
+	//
+	// Its fields (subnet, gateway, bridge) are required whenever the template is
+	// present, so there is no half-specified template to reason about and no
+	// cross-field rule needed to enforce that: the field list IS the rule.
+	// +optional
+	NADTemplate *NADTemplate `json:"nadTemplate,omitempty"`
+}
+
+// NADTemplate is the NetworkAttachmentDefinition config cloned into every NAD a
+// pool mints.
+//
+// Only the fields this project actually sets are modelled. A CNI feature that is
+// not here cannot be expressed at all — that is the accepted cost of typing the
+// template rather than embedding an opaque JSON blob. In exchange, a missing
+// bridge, an out-of-range VLAN or an unknown plugin type is rejected by the CRD
+// at admission, instead of surfacing later as a VM stuck in FailedCreatePodSandBox.
+//
+// Addressing lives here rather than on IPPoolSpec because it is addressing OF
+// THE MINTED CONFIG, and is meaningless without one. subnet becomes the NAD's
+// ipam.range — which in a CNI config is what selects the Whereabouts allocation
+// ledger — and gateway becomes ipam.gateway. The claim's own address is not here:
+// range_start and range_end are injected per claim, from the address the
+// controller assigned it.
+type NADTemplate struct {
+	// subnet is the CIDR the minted NAD draws from, e.g. "10.66.3.0/24". It becomes
+	// ipam.range in the generated config.
+	//
+	// This is not the allocatable band — that is IPPool.spec.range, which must lie
+	// within this subnet. Several pools may share one subnet as long as their bands
+	// are disjoint.
 	// +kubebuilder:validation:Pattern=`^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])/(3[0-2]|[12]?[0-9])$`
 	// +required
 	Subnet string `json:"subnet"`
 
-	// range is the inclusive band of addresses available to IPRequest claims.
-	// It must be disjoint from the Whereabouts dynamic window (.200-.220 on
-	// 10.66.3.0/24) and from the MetalLB pool (.221-.240) — see the README.
-	// +required
-	Range IPRange `json:"range"`
-
 	// gateway is the default gateway handed to VMs whose address comes from this
-	// pool. It must sit outside the allocatable range.
+	// pool. It must sit inside subnet — a bridge binding needs it on the same L2 —
+	// and outside the allocatable range in IPPool.spec.range.
 	// +kubebuilder:validation:Pattern=`^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$`
 	// +required
 	Gateway string `json:"gateway"`
 
-	// templateNAD is the NetworkAttachmentDefinition whose bridge, dns and routes
-	// are cloned into each generated per-VM NAD that this pool mints (design §5.4).
-	// Written as "namespace/name" or bare "name" for the default namespace.
+	// type is the CNI plugin type. cnv-bridge is the linux bridge binding used on
+	// this cluster's underlay.
+	// +kubebuilder:validation:Enum=cnv-bridge;bridge
+	// +kubebuilder:default=cnv-bridge
+	// +optional
+	Type string `json:"type,omitempty"`
+
+	// bridge is the linux bridge the VM's interface is enslaved to, e.g. "br0".
 	// +kubebuilder:validation:MinLength=1
 	// +required
-	TemplateNAD string `json:"templateNAD"`
+	Bridge string `json:"bridge"`
+
+	// vlan is the VLAN id, when the bridge is VLAN-filtered. Omit for an untagged
+	// bridge.
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=4094
+	// +optional
+	VLAN *int32 `json:"vlan,omitempty"`
+
+	// macspoofchk enables MAC spoof checking on the interface.
+	// +optional
+	MacSpoofChk *bool `json:"macspoofchk,omitempty"`
+
+	// dns is handed to the guest alongside its address.
+	// +optional
+	DNS *NADDNS `json:"dns,omitempty"`
+
+	// routes are injected into the guest alongside the default gateway.
+	// +optional
+	Routes []NADRoute `json:"routes,omitempty"`
+}
+
+// NADDNS is the DNS config handed to the guest.
+type NADDNS struct {
+	// nameservers is the list of resolvers.
+	// +optional
+	Nameservers []string `json:"nameservers,omitempty"`
+
+	// domain is the local domain the guest resolves within.
+	// +optional
+	Domain string `json:"domain,omitempty"`
+
+	// search is the list of search domains.
+	// +optional
+	Search []string `json:"search,omitempty"`
+}
+
+// NADRoute is a route injected into the guest.
+type NADRoute struct {
+	// dst is the destination CIDR, e.g. "0.0.0.0/0".
+	// +kubebuilder:validation:MinLength=1
+	// +required
+	Dst string `json:"dst"`
+
+	// gw is the next hop. Omit to route via the interface's own gateway.
+	// +optional
+	GW string `json:"gw,omitempty"`
 }
 
 // IPRange is an inclusive address band. Both bounds are required. A band holding
@@ -99,10 +197,11 @@ type IPPoolStatus struct {
 	// conditions represent the current state of the IPPool resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
 	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
+	// Condition types set here:
+	// - "Available": True when the pool is usable -- its range parses, and, when it
+	//   has a nadTemplate, that template's subnet and gateway are coherent with the
+	//   range. A False carries the cause in its reason, e.g. "RangeInvalid"; there is
+	//   no separate "Degraded" type, which would be its exact complement.
 	//
 	// The status of each condition is one of True, False, or Unknown.
 	// +listType=map
@@ -114,10 +213,10 @@ type IPPoolStatus struct {
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
 // +kubebuilder:resource:scope=Cluster
-// +kubebuilder:printcolumn:name="Subnet",type=string,JSONPath=`.spec.subnet`
+// +kubebuilder:printcolumn:name="Subnet",type=string,JSONPath=`.spec.nadTemplate.subnet`
 // +kubebuilder:printcolumn:name="Start",type=string,JSONPath=`.spec.range.start`
 // +kubebuilder:printcolumn:name="End",type=string,JSONPath=`.spec.range.end`
-// +kubebuilder:printcolumn:name="Gateway",type=string,JSONPath=`.spec.gateway`
+// +kubebuilder:printcolumn:name="Gateway",type=string,JSONPath=`.spec.nadTemplate.gateway`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
 
 // IPPool is the Schema for the ippools API

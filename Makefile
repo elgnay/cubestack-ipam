@@ -177,6 +177,40 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
+##@ Helm
+
+HELM ?= helm
+CHART_DIR ?= charts/cubestack-ipam
+# The chart takes the image as separate repository and tag values, so a full IMG
+# ref cannot be passed through. These split the default `controller:latest`
+# correctly; for a registry with a port in it, set them explicitly.
+IMAGE_REPO ?= $(word 1,$(subst :, ,$(IMG)))
+IMAGE_TAG ?= $(word 2,$(subst :, ,$(IMG)))
+HELM_NAMESPACE ?= cubestack-system
+
+.PHONY: helm-sync-crds
+helm-sync-crds: manifests ## Refresh the chart's crds/ from the generated bases.
+	cp config/crd/bases/*.yaml $(CHART_DIR)/crds/
+
+.PHONY: helm-crds-check
+helm-crds-check: manifests ## Verify the chart's crds/ has not drifted from config/crd/bases.
+	@diff -rq config/crd/bases $(CHART_DIR)/crds >/dev/null || { \
+		echo "chart crds/ has drifted from config/crd/bases -- run 'make helm-sync-crds'" >&2; \
+		diff -rq config/crd/bases $(CHART_DIR)/crds >&2; exit 1; }
+
+.PHONY: helm-lint
+helm-lint: helm-crds-check ## Lint the chart and render it.
+	"$(HELM)" lint $(CHART_DIR)
+	@out="$$( "$(HELM)" template cubestack-ipam $(CHART_DIR) --namespace $(HELM_NAMESPACE) )"; \
+	if [ -z "$$out" ]; then echo "helm template rendered nothing" >&2; exit 1; fi; \
+	echo "helm template: $$(printf '%s\n' "$$out" | grep -c '^kind:') objects"
+
+.PHONY: helm-install
+helm-install: helm-crds-check ## Install or upgrade the chart.
+	"$(HELM)" upgrade --install cubestack-ipam $(CHART_DIR) \
+		--namespace $(HELM_NAMESPACE) --create-namespace \
+		--set image.repository=$(IMAGE_REPO) --set image.tag=$(IMAGE_TAG)
+
 ##@ Dependencies
 
 ## Location to install dependencies to

@@ -10,9 +10,15 @@ spec:
   # IPPool is cluster-scoped, so this is a bare name with no namespace.
   poolRef: cubestack-static-v4
 
-  # Optional. Naming an address makes the generated NAD name deterministic
-  # (vm-static-10-66-3-105), which is what lets the VM manifest be written before
-  # the request is satisfied. Omit it and the controller picks a free address --
-  # in that case there is no way to predict the NAD name, so the VM can only be
-  # created after reading status.nadName.
-  requestedIP: 10.66.3.105
+  # Optional. The NAD to mint for this claim, in this namespace. The generated NAD
+  # takes this name verbatim, which is what lets the VM manifest be written before
+  # the claim is satisfied: the VM's network list already names the NAD it will have.
+  #
+  # Omit it for a ledger-only claim -- an address is bound and nothing is created.
+  # A claim created from a VirtualMachine always sets it, because the VM's own
+  # manifest has to name the NAD.
+  nad: cubestack6-static
+
+  # There is deliberately no requestedIP. The controller takes the lowest free
+  # address in the pool, so allocation is deterministic and the address cannot be
+  # contradicted by a name the user guessed. Read status.assignedIP for the result.
