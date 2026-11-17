@@ -1,0 +1,143 @@
+# A VirtualMachine CRD for the MutatingAdmissionPolicy spike, and for nothing else.
+#
+# This is deliberately NOT the same CRD as ../../testdata/virtualmachine-crd.yaml.
+# That one exists so the IPAM controller suite can watch a third-party type, and it
+# declares `x-kubernetes-preserve-unknown-fields: true` over the whole spec, which
+# switches structural pruning OFF. The spike asks exactly the question that flag
+# would erase — whether a value injected at admission survives the CRD's schema —
+# so it needs a CRD that prunes like the real one does.
+#
+# What is modelled, and why:
+#
+#   * spec.template.spec.networks[] and spec.template.spec.domain.devices.interfaces[]
+#     are listed as atomic. The real CRD does not say `x-kubernetes-list-type`, and an
+#     array with no list type is atomic by default, so the two are equivalent — it is
+#     written out here only so the spike can point at it and say so.
+#   * `domain.devices` is required, matching the real CRD. That requirement is not
+#     decoration: it is why a JSON Patch that appends to .../interfaces can rely on the
+#     parent existing, and the spike would draw the wrong conclusion without it.
+#
+# What is not modelled: essentially all of KubeVirt. There is no validation webhook in
+# envtest, so nothing checks that every network has a matching interface, that a
+# bridge interface has a valid shape, or that memory is declared. Those are KubeVirt's
+# concerns and they are out of scope — this CRD exists to test admission mutation, not
+# to be a faithful KubeVirt.
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: virtualmachines.kubevirt.io
+spec:
+  group: kubevirt.io
+  scope: Namespaced
+  names:
+    kind: VirtualMachine
+    listKind: VirtualMachineList
+    plural: virtualmachines
+    singular: virtualmachine
+    shortNames:
+      - vm
+      - vms
+  versions:
+    - name: v1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            apiVersion:
+              type: string
+            kind:
+              type: string
+            metadata:
+              type: object
+            spec:
+              type: object
+              properties:
+                runStrategy:
+                  type: string
+                template:
+                  type: object
+                  properties:
+                    metadata:
+                      type: object
+                      x-kubernetes-preserve-unknown-fields: true
+                    spec:
+                      type: object
+                      properties:
+                        domain:
+                          type: object
+                          required:
+                            - devices
+                          properties:
+                            resources:
+                              type: object
+                              properties:
+                                requests:
+                                  type: object
+                                  properties:
+                                    memory:
+                                      type: string
+                            devices:
+                              type: object
+                              properties:
+                                disks:
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                  items:
+                                    type: object
+                                    properties:
+                                      name:
+                                        type: string
+                                interfaces:
+                                  type: array
+                                  x-kubernetes-list-type: atomic
+                                  items:
+                                    type: object
+                                    required:
+                                      - name
+                                    properties:
+                                      name:
+                                        type: string
+                                      macAddress:
+                                        type: string
+                                      bridge:
+                                        type: object
+                                      masquerade:
+                                        type: object
+                        networks:
+                          type: array
+                          x-kubernetes-list-type: atomic
+                          items:
+                            type: object
+                            required:
+                              - name
+                            properties:
+                              name:
+                                type: string
+                              multus:
+                                type: object
+                                required:
+                                  - networkName
+                                properties:
+                                  networkName:
+                                    type: string
+                                  default:
+                                    type: boolean
+                              pod:
+                                type: object
+                              bridge:
+                                type: object
+                        nodeSelector:
+                          type: object
+                          additionalProperties:
+                            type: string
+                        volumes:
+                          type: array
+                          x-kubernetes-list-type: atomic
+                          items:
+                            type: object
+                            x-kubernetes-preserve-unknown-fields: true
+            status:
+              type: object
+              x-kubernetes-preserve-unknown-fields: true

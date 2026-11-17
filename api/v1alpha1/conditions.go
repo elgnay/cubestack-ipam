@@ -22,20 +22,21 @@ package v1alpha1
 // directly.
 type ConditionType = string
 
-// Condition types set on IPPool and IPRequest.
+// Condition types set on IPPool, IPRequest and IPRangeRequest.
 //
 // There is one primary condition per kind — Available for a pool, Ready for a
-// claim — and the cause goes in its Reason rather than into a condition type of
-// its own. A Degraded condition was considered and deliberately left out: on both
-// kinds it would be the exact complement of the primary one, so two entries would
-// carry one fact and could disagree.
+// claim and for a block — and the cause goes in its Reason rather than into a
+// condition type of its own. A Degraded condition was considered and deliberately
+// left out: on every kind it would be the exact complement of the primary one, so
+// two entries would carry one fact and could disagree.
 const (
 	// ConditionAvailable is True when an IPPool is usable — its range parses and
 	// its band and gateway are coherent.
 	ConditionAvailable ConditionType = "Available"
 
 	// ConditionReady is True when an IPRequest has been satisfied: an address is
-	// assigned, and a NAD exists if one was asked for.
+	// assigned, and a NAD exists if one was asked for. It is also the primary
+	// condition on an IPRangeRequest, True once a block is recorded in status.
 	ConditionReady ConditionType = "Ready"
 
 	// ConditionTemplateMissing is True when a claim asks for a NAD (spec.nad is
@@ -58,11 +59,51 @@ const (
 	ReasonRangeValid     = "RangeValid"
 	ReasonRangeInvalid   = "RangeInvalid"
 	ReasonRangeExhausted = "RangeExhausted"
-	ReasonBound          = "Bound"
-	ReasonTemplateAbsent = "TemplateAbsent"
-	ReasonNADNotOwned    = "NADNotOwned"
-	ReasonNADMissing     = "NADMissing"
-	ReasonQueryFailed    = "QueryFailed"
+	// ReasonRangeFragmented accompanies Ready=False on an IPRangeRequest whose pool
+	// holds at least spec.allocation.count free addresses in total, but not that many together.
+	// It is deliberately distinct from ReasonRangeExhausted because the two
+	// prescribe different fixes: an exhausted band needs a bigger pool, a fragmented
+	// one needs a smaller request or the fragmenting claims released. Reporting
+	// "exhausted" when a run merely failed to line up would be false, and a false
+	// diagnosis is worse than a vague one.
+	ReasonRangeFragmented = "RangeFragmented"
+	ReasonBound           = "Bound"
+	ReasonTemplateAbsent  = "TemplateAbsent"
+	ReasonNADNotOwned     = "NADNotOwned"
+	ReasonNADMissing      = "NADMissing"
+	ReasonQueryFailed     = "QueryFailed"
+
+	// The reasons below belong to Exact allocation. Each one is a different
+	// actionable fact: an out-of-range address means the request and the pool
+	// disagree, an excluded one means an admin reserved it, and an unavailable one
+	// means another holder has it. Collapsing them into one reason would leave the
+	// user to work out which of three unrelated fixes applies.
+	//
+	// ReasonAddressOutOfRange and ReasonRangeOutOfRange mean the requested value is
+	// not inside the pool's spec.range at all.
+	ReasonAddressOutOfRange = "AddressOutOfRange"
+	ReasonRangeOutOfRange   = "RangeOutOfRange"
+
+	// ReasonAddressExcluded and ReasonRangeExcluded mean the requested value is
+	// inside one of the pool's spec.allocation.exclude bands.
+	ReasonAddressExcluded = "AddressExcluded"
+	ReasonRangeExcluded   = "RangeExcluded"
+
+	// ReasonAddressUnavailable and ReasonRangeUnavailable mean the requested value
+	// is valid for the pool but already held. The holders are listed in
+	// status.blockers.
+	ReasonAddressUnavailable = "AddressUnavailable"
+	ReasonRangeUnavailable   = "RangeUnavailable"
+
+	// ReasonExactNotAllowed means the pool sets spec.allocation.allowExact to
+	// false.
+	ReasonExactNotAllowed = "ExactNotAllowed"
+
+	// ReasonAllocationInvalid means the request itself is malformed — a status that
+	// disagrees with spec, or an object predating the allocation field that never
+	// recorded the size of its block. Deleting and recreating is the fix in every
+	// case, which is what the message says.
+	ReasonAllocationInvalid = "AllocationInvalid"
 )
 
 // Annotations read from a VirtualMachine to drive the claim layer. Keys are
@@ -76,6 +117,12 @@ const (
 	// AnnotationNADName overrides the name of the NAD minted for the VM. Optional;
 	// it defaults to DefaultNADName(vm.Name), i.e. "<vm-name>-static".
 	AnnotationNADName = "ipam.cubestack.io/nad-name"
+
+	// AnnotationAddress asks for a specific address. Optional, and Exact when
+	// present: the claim fails rather than being given a different address if this
+	// one is out of range, excluded, or already held. Ignored when AnnotationPool
+	// is absent, because without a pool there is no claim to allocate.
+	AnnotationAddress = "ipam.cubestack.io/address"
 )
 
 // Labels written by the controllers.

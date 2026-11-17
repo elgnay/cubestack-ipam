@@ -22,6 +22,9 @@ resources:
 # default, aiding admins in cluster management. Those roles are
 # not used by the cubestack-ipam itself. You can comment the following lines
 # if you do not want those helpers be installed with your Project.
+- iprangerequest_admin_role.yaml
+- iprangerequest_editor_role.yaml
+- iprangerequest_viewer_role.yaml
 - iprequest_admin_role.yaml
 - iprequest_editor_role.yaml
 - iprequest_viewer_role.yaml

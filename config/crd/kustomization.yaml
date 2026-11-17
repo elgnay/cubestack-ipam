@@ -4,6 +4,7 @@
 resources:
 - bases/ipam.cubestack.io_ippools.yaml
 - bases/ipam.cubestack.io_iprequests.yaml
+- bases/ipam.cubestack.io_iprangerequests.yaml
 # +kubebuilder:scaffold:crdkustomizeresource
 
 patches:

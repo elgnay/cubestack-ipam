@@ -5,11 +5,22 @@
 # NAD name, and the second would fail as NADNameTaken.
 #
 # ipam_v1alpha1_ippool_minimal.yaml is deliberately NOT listed here. It is the
-# alternative form of a pool -- a band with no nadTemplate -- and it carries the
-# same range as cubestack-static-v4. Two pools over one band is the
-# misconfiguration the README warns about: each allocates against its own PoolRef
-# and would happily hand the same address to two claims. Use it instead of the
-# full pool, not alongside it.
+# alternative form of a pool -- a band with no nadTemplate -- and stands in for
+# the full pool rather than alongside it. It is not applied by default because a
+# ledger-only pool reserves addresses nothing consumes.
+#
+# ipam_v1alpha1_iprangerequest.yaml is NOT listed either, for a harder reason:
+# every sample here shares dev-ip-pool, and the range request would take the
+# lowest free addresses in it -- exactly where the IPRequest and VirtualMachine
+# samples above expect to land. Applying them together makes which sample wins a
+# matter of ordering, which is not a thing a sample should teach.
+#
+# (An earlier version of this note claimed it "carries the same range as
+# cubestack-static-v4". It does not: its band is .150-.189 and the pool here is
+# .200-.230, so listing both would not actually collide. The real hazard that
+# note was reaching for is two pools declaring OVERLAPPING bands -- each
+# allocates against its own PoolRef and would happily hand the same address to
+# two claims. Nothing detects that; band choice is the whole of the protection.)
 resources:
 - ipam_v1alpha1_ippool.yaml
 - ipam_v1alpha1_iprequest.yaml

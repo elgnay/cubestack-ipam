@@ -1,0 +1,170 @@
+{{- /*
+
+  Per-member L2 underlay injection, for VirtualMachinePool members.
+
+  The problem this closes: a pool member's spec comes from
+  spec.virtualMachineTemplate, and multus.networkName there is ONE literal string
+  handed to every member. At replicas: 1 that works only because a human hard-codes
+  the single member's name; at replicas: 2 member -1 names member 0's NAD, and on a
+  `static` pool nothing refuses the duplicate -- both members come up on one address
+  and the symptom is intermittent connectivity.
+
+  A MutatingAdmissionPolicy fixes it where it happens: at admission, before the VM is
+  stored. It derives the NAD name from the object being created, so each member gets
+  its own reference and controller #2 stays create-only -- nothing has to write a
+  member after the pool controller is done with it.
+
+  The policy is written here rather than in Go on purpose. A webhook we wrote would
+  be a second manager to deploy, its own TLS and its own availability to reason about;
+  this is three expressions of CEL and no process at all.
+
+  Measured behaviour, and the reasoning behind each non-obvious choice, is in
+  docs/mutating-admission-policy-spike.md. The three that will bite anyone who edits
+  this file:
+
+    - `patchType: JSONPatch` is forced. ApplyConfiguration "may not modify atomic
+      structs, maps or arrays", and KubeVirt declares no merge key on networks[] or
+      interfaces[], so both are atomic.
+    - The array is created EMPTY and the element appended as a bare object
+      initializer, in two patches. `value: [Object...{...}]` -- a list holding an
+      object initializer -- panics the API server on cel-go 0.26.0, which is what
+      1.35.x and 1.36.x pin.
+    - The initializers are typed (`Object.<path>{...}`) because Kubernetes CEL
+      requires map literals to be homogeneous; JSON-style `value: {...}` does not
+      compile.
+
+*/ -}}
+{{- if .Values.map.enabled }}
+{{- if not .Values.map.namespaces }}
+{{- fail "map.namespaces is empty. It is a failurePolicy: Fail policy scoped by namespace, so an empty list is refused rather than widened to the whole cluster -- list the namespaces that use pool claims, or set map.enabled=false." }}
+{{- end }}
+
+{{- /* Which MutatingAdmissionPolicy version is served, if any. The reasoning -- why a
+       group/version test is the wrong question, and why the answer depends on whether
+       discovery has run -- is in _helpers.tpl beside the definition. Neither branch
+       matching means the feature gate is off, or the cluster predates the feature.
+       That is not an error: this chart still deploys a working controller. Nothing is
+       rendered and the install notes say so, because a silent skip looks exactly like
+       a policy that is running. */ -}}
+{{- $api := include "cubestack-ipam.mapAPIVersion" . }}
+{{- if $api }}
+
+{{- /* The derived NAD name, and the reference built from it, are each written ONCE
+       and used by both the guard and the mutation. Spelling them twice is the bug
+       this shape exists to prevent: the guard asks "is MY reference already here",
+       so if it and the mutation disagreed by a character the policy would append a
+       second copy of a reference it does not recognise as its own -- on every
+       evaluation, forever.
+
+       It mirrors internal/ipam/nad.go DefaultNADName() and the
+       ipam.cubestack.io/nad-name override that virtualmachine_controller.go applies
+       first, including that file's `if nadName == ""` fallback, which is the `!= ''`
+       test below.
+
+       One branch is deliberately NOT mirrored: DefaultNADName truncates names over
+       246 characters and appends a SHA-256 digest. CEL has no sha256, so for a VM
+       with a name that long this policy injects a reference the controller will not
+       mint, and the VM waits. Names that long are not reachable through a pool (the
+       pool appends an ordinal), and a standalone VM hitting this would fail loudly
+       rather than silently -- but it is a limit, not an oversight. */}}
+{{- $nadName := `(has(object.metadata.annotations) && 'ipam.cubestack.io/nad-name' in object.metadata.annotations && object.metadata.annotations['ipam.cubestack.io/nad-name'] != '' ? object.metadata.annotations['ipam.cubestack.io/nad-name'] : object.metadata.name + "-static")` }}
+
+{{- /* Qualified by the VM's OWN namespace, never a literal. The controller mints the
+       NAD in the namespace the claim is in, and the claim is in the VM's namespace,
+       so "default/<name>-static" names a NAD that is never minted for a VM anywhere
+       else -- and the VM waits forever. Every VM in the cluster this was built
+       against happens to live in `default`, which is exactly why the literal
+       survived as long as it did. */}}
+{{- $ref := printf `object.metadata.namespace + "/" + %s` $nadName }}
+
+{{- /* Two `has` chains, each asked twice -- once for the create-the-array patch and
+       once for the append. That is the cost of not being able to nest an object
+       initializer in a list literal (see the header). */}}
+{{- $hasNets := `has(object.spec) && has(object.spec.template) && has(object.spec.template.spec) && has(object.spec.template.spec.networks)` }}
+{{- $hasIfaces := `has(object.spec) && has(object.spec.template) && has(object.spec.template.spec) && has(object.spec.template.spec.domain) && has(object.spec.template.spec.domain.devices) && has(object.spec.template.spec.domain.devices.interfaces)` }}
+
+{{- /* The interface is named "underlay" to match the network. Any name would do,
+       but the pool templates in the user guide use this one and the two lists are
+       matched by name. */}}
+{{- $appendNet := printf `JSONPatch{op: "add", path: "/spec/template/spec/networks/-", value: Object.spec.template.spec.networks{name: "underlay", multus: Object.spec.template.spec.networks.multus{networkName: %s}}}` $ref }}
+{{- $appendIface := `JSONPatch{op: "add", path: "/spec/template/spec/domain/devices/interfaces/-", value: Object.spec.template.spec.domain.devices.interfaces{name: "underlay", bridge: Object.spec.template.spec.domain.devices.interfaces.bridge{}}}` }}
+apiVersion: {{ $api }}
+kind: MutatingAdmissionPolicy
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-vm-underlay
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+spec:
+  {{- /* Fail, not Ignore. Ignore would admit the VM unchanged, which is the silent
+         one-address-for-two-VMs outcome this policy exists to prevent: better to
+         reject the write, where the error is visible and the pool retries. */}}
+  failurePolicy: Fail
+  {{- /* The mutations are evaluated twice for a single create; without the guard
+         below the network and interface would be appended twice, and a third time
+         on the next evaluation. `IfNeeded` additionally re-runs the policy when a
+         later mutator touches the object -- kubemacpool-mutator writes
+         interfaces[].macAddress on these very VMs. The guard makes that a no-op.
+
+         The API guarantees no ordering between this and other mutating webhooks.
+         That is a property of the mutating phase, not of MAP: a Go webhook of our
+         own would be exposed identically, and kubemacpool and virt-api-mutator
+         already coexist on these objects. The destructive ordering -- a webhook
+         that replaces the whole interfaces array -- is measured in §6 of the doc. */}}
+  reinvocationPolicy: IfNeeded
+  matchConstraints:
+    resourceRules:
+    - apiGroups: ["kubevirt.io"]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["virtualmachines"]
+  matchConditions:
+    {{- /* The trigger is the annotation the controller acts on, not a label and not
+           the pool. Any VM that claims a pool gets the reference its claim pays for;
+           a VM that does not is untouched. UPDATE is included deliberately: the
+           field is then declarative, and MAP restores the reference if something
+           else strips it. Verified live -- a template revision bump that rewrites a
+           member leaves the reference correct. */}}
+    - name: has-ipam-pool-annotation
+      expression: has(object.metadata.annotations) && 'ipam.cubestack.io/pool' in object.metadata.annotations
+    - name: underlay-not-injected-yet
+      expression: |
+        !({{ $hasNets }} && object.spec.template.spec.networks.exists(n, has(n.multus) && has(n.multus.networkName) && n.multus.networkName == {{ $ref }}))
+  mutations:
+    - patchType: JSONPatch
+      jsonPatch:
+        expression: |
+          ({{ $hasNets }}
+            ? []
+            : [JSONPatch{op: "add", path: "/spec/template/spec/networks", value: []}])
+          + [{{ $appendNet }}]
+          + ({{ $hasIfaces }}
+            ? []
+            : [JSONPatch{op: "add", path: "/spec/template/spec/domain/devices/interfaces", value: []}])
+          + [{{ $appendIface }}]
+---
+apiVersion: {{ $api }}
+kind: MutatingAdmissionPolicyBinding
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-vm-underlay
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+spec:
+  policyName: {{ include "cubestack-ipam.fullname" . }}-vm-underlay
+  matchResources:
+    {{- /* By namespace name, not by label. `kubernetes.io/metadata.name` is applied
+           to every namespace by the apiserver, so this needs no cooperation from
+           whoever creates the namespaces -- and it is the one thing a namespace
+           selector can key on that is guaranteed to be there.
+
+           The policy is cluster-scoped and applies to whatever this selector
+           admits; `map.namespaces` is the whole of its reach. */}}
+    namespaceSelector:
+      matchExpressions:
+      - key: kubernetes.io/metadata.name
+        operator: In
+        values:
+        {{- range .Values.map.namespaces }}
+        - {{ . | quote }}
+        {{- end }}
+{{- end }}
+{{- end }}

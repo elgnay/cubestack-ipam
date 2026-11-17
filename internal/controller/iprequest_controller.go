@@ -28,8 +28,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/workqueue"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
@@ -62,6 +64,10 @@ type IPRequestReconciler struct {
 // +kubebuilder:rbac:groups=ipam.cubestack.io,resources=iprequests,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ipam.cubestack.io,resources=iprequests/status,verbs=get;patch;update
 // +kubebuilder:rbac:groups=ipam.cubestack.io,resources=ippools,verbs=get;list;watch
+// list on range requests is the shared ledger's read, not an action on them --
+// this controller never touches an IPRangeRequest, but it must see the blocks one
+// holds or it will allocate straight through them.
+// +kubebuilder:rbac:groups=ipam.cubestack.io,resources=iprangerequests,verbs=get;list;watch
 // +kubebuilder:rbac:groups=k8s.cni.cncf.io,resources=network-attachment-definitions,verbs=get;list;watch;create;update
 
 // Reconcile assigns an address and mints a NAD.
@@ -112,7 +118,7 @@ func (r *IPRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 	if err != nil {
 		var alloc *allocError
 		if errors.As(err, &alloc) {
-			return r.fail(ctx, original, claim, alloc.reason, alloc.message)
+			return r.fail(ctx, original, claim, alloc.reason, alloc.message, alloc.blockers...)
 		}
 		return ctrl.Result{}, err
 	}
@@ -157,9 +163,14 @@ func (r *IPRequestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 
 // allocError is a failure that is the user's or admin's to fix rather than a
 // transient error, so Reconcile turns it into a condition instead of a retry.
+//
+// blockers is the structured detail behind an Exact failure: the objects holding
+// the requested address, or the pool exclusion that reserves it. It is empty for
+// Auto failures, whose only cause is the pool itself.
 type allocError struct {
-	reason  string
-	message string
+	reason   string
+	message  string
+	blockers []ipamv1alpha1.Blocker
 }
 
 func (e *allocError) Error() string { return e.message }
@@ -171,10 +182,20 @@ func (e *allocError) Error() string { return e.message }
 // reconcile would let a newly created claim with a lower address displace a
 // running VM, and an address that moves under a live guest is precisely the
 // instability this project exists to remove.
+//
+// The strategy splits only the not-yet-bound case. Auto takes the lowest free
+// address; Exact takes the requested one or fails. There is no fallback between
+// them — substituting a free address for a requested one would make a typo
+// indistinguishable from a successful claim.
 func (r *IPRequestReconciler) assign(ctx context.Context, claim *ipamv1alpha1.IPRequest, pool *ipamv1alpha1.IPPool) (netip.Addr, error) {
 	addrs, err := ipam.ParseRange(pool.Spec.Range.Start, pool.Spec.Range.End)
 	if err != nil {
 		return netip.Addr{}, &allocError{reason: ipamv1alpha1.ReasonRangeInvalid, message: err.Error()}
+	}
+
+	requested, err := requestedAddress(claim)
+	if err != nil {
+		return netip.Addr{}, err
 	}
 
 	if held := strings.TrimSpace(claim.Status.AssignedIP); held != "" {
@@ -196,71 +217,93 @@ func (r *IPRequestReconciler) assign(ctx context.Context, claim *ipamv1alpha1.IP
 					"the address is retained because the NAD still carries it", addr, pool.Name, pool.Spec.Range.Start, pool.Spec.Range.End),
 			}
 		}
+		// The allocation is immutable at the schema, so this can only be a status
+		// written by hand. It is still worth naming: the alternative is binding a
+		// claim whose spec and status disagree about which address it wants.
+		if requested.IsValid() && requested != addr {
+			return netip.Addr{}, &allocError{
+				reason: ipamv1alpha1.ReasonAllocationInvalid,
+				message: fmt.Sprintf("status records address %s but spec.allocation.address asks for %s; "+
+					"delete this IPRequest to release the address and claim a new one", addr, requested),
+			}
+		}
 		return addr, nil
 	}
 
-	taken, err := r.takenAddresses(ctx, claim)
+	l, err := readLedger(ctx, r.Client, claim.Spec.PoolRef, claim.UID)
 	if err != nil {
 		return netip.Addr{}, err
 	}
 
+	if requested.IsValid() {
+		return exactAddress(claim, pool, addrs, l, requested)
+	}
+
+	taken, err := l.withExclusions(pool.Spec.Exclusions())
+	if err != nil {
+		return netip.Addr{}, &allocError{reason: ipamv1alpha1.ReasonRangeInvalid, message: err.Error()}
+	}
+
 	addr, ok := ipam.FirstFree(addrs, taken)
 	if !ok {
+		qualifier := "claimed"
+		if len(pool.Spec.Exclusions()) > 0 {
+			qualifier = "claimed or excluded by the pool"
+		}
 		return netip.Addr{}, &allocError{
 			reason: ipamv1alpha1.ReasonRangeExhausted,
-			message: fmt.Sprintf("all %d addresses in pool %s (%s-%s) are claimed",
-				len(addrs), pool.Name, pool.Spec.Range.Start, pool.Spec.Range.End),
+			message: fmt.Sprintf("all %d addresses in pool %s (%s-%s) are %s",
+				len(addrs), pool.Name, pool.Spec.Range.Start, pool.Spec.Range.End, qualifier),
 		}
 	}
 	return addr, nil
 }
 
-// takenAddresses collects every address held by claims against the same pool,
-// across all namespaces — the pool is cluster-scoped, so the ledger is too.
+// exactAddress decides whether a requested address can be bound.
 //
-// This reads IPRequests rather than a pool-owned ledger, because the claim set is
-// the only authoritative record (design §R3). A second list on the pool would be a
-// second thing to keep in step, and the two would eventually disagree.
-//
-// KNOWN RACE: two claims created in the same instant can both be reconciled
-// against a cache that does not yet show the other's assignment, and both pick the
-// same address. The window is small, but how bad it is depends on the pool's ipam
-// mode, and that is worth knowing before assuming the CNI is behind this. On a
-// whereabouts pool the second CNI ADD is refused, so the collision is loud and the
-// audit explains a failure that already happened. On a static pool nothing refuses
-// it: both VMs come up sharing an address and the symptom is intermittent
-// connectivity, which makes the audit sweep's DuplicateAddress the only detector
-// rather than a backstop. Closing the race properly needs a compare-and-swap on
-// something address-shaped, which this API gave up when per-address claim objects
-// were dropped.
-func (r *IPRequestReconciler) takenAddresses(ctx context.Context, claim *ipamv1alpha1.IPRequest) (map[netip.Addr]struct{}, error) {
-	var claims ipamv1alpha1.IPRequestList
-	if err := r.List(ctx, &claims); err != nil {
-		return nil, fmt.Errorf("listing IPRequests: %w", err)
+// The checks are ordered from the cheapest fact to the most specific one, and each
+// has its own reason because each prescribes a different fix: widen the pool,
+// change the pool's exclusions, or release/choose around the current holder. The
+// final failure carries blockers so the holder can be looked up rather than
+// guessed at.
+func exactAddress(claim *ipamv1alpha1.IPRequest, pool *ipamv1alpha1.IPPool, addrs []netip.Addr, l *ledger, requested netip.Addr) (netip.Addr, error) {
+	if !pool.Spec.AllowsExact() {
+		return netip.Addr{}, &allocError{
+			reason: ipamv1alpha1.ReasonExactNotAllowed,
+			message: fmt.Sprintf("pool %s sets allocation.allowExact to false, so address %s cannot be requested by name; "+
+				"remove spec.allocation and let the pool choose", pool.Name, requested),
+		}
 	}
 
-	taken := make(map[netip.Addr]struct{}, len(claims.Items))
-	for i := range claims.Items {
-		other := &claims.Items[i]
-		// Compared by UID rather than name: the claim in hand may not have one yet.
-		if other.Spec.PoolRef != claim.Spec.PoolRef || other.UID == claim.UID {
-			continue
+	if !containsAddr(addrs, requested) {
+		return netip.Addr{}, &allocError{
+			reason: ipamv1alpha1.ReasonAddressOutOfRange,
+			message: fmt.Sprintf("requested address %s is outside pool %s's range %s-%s",
+				requested, pool.Name, pool.Spec.Range.Start, pool.Spec.Range.End),
 		}
-		held := strings.TrimSpace(other.Status.AssignedIP)
-		if held == "" {
-			// Pending and Failed claims hold nothing. A failed claim deliberately does
-			// not consume an address, so a misconfigured one cannot exhaust a pool.
-			continue
-		}
-		addr, err := netip.ParseAddr(held)
-		if err != nil {
-			// One claim's malformed status must not block every other claim in the
-			// pool; it is that claim's own condition, and the audit's, to report.
-			continue
-		}
-		taken[addr] = struct{}{}
 	}
-	return taken, nil
+
+	for _, band := range pool.Spec.Exclusions() {
+		if !bandContains(band, requested) {
+			continue
+		}
+		return netip.Addr{}, &allocError{
+			reason: ipamv1alpha1.ReasonAddressExcluded,
+			message: fmt.Sprintf("requested address %s is inside an excluded band %s-%s of pool %s",
+				requested, band.Start, band.End, pool.Name),
+			blockers: []ipamv1alpha1.Blocker{exclusionBlocker(pool.Name, band)},
+		}
+	}
+
+	if blockers := l.blockersForAddress(requested); len(blockers) > 0 {
+		return netip.Addr{}, &allocError{
+			reason:   ipamv1alpha1.ReasonAddressUnavailable,
+			message:  fmt.Sprintf("requested address %s is already held in pool %s; status.blockers names the holder", requested, pool.Name),
+			blockers: blockers,
+		}
+	}
+
+	return requested, nil
 }
 
 // fail records a claim that could not be satisfied.
@@ -269,8 +312,12 @@ func (r *IPRequestReconciler) takenAddresses(ctx context.Context, claim *ipamv1a
 // its pool deleted, its template withdrawn — still holds its address, and the NAD
 // it owns still carries it. Clearing the field would hand that address to someone
 // else while the VM on it is still running.
-func (r *IPRequestReconciler) fail(ctx context.Context, original, claim *ipamv1alpha1.IPRequest, reason, message string) (ctrl.Result, error) {
+func (r *IPRequestReconciler) fail(ctx context.Context, original, claim *ipamv1alpha1.IPRequest, reason, message string, blockers ...ipamv1alpha1.Blocker) (ctrl.Result, error) {
 	claim.Status.Phase = ipamv1alpha1.IPRequestPhaseFailed
+	// Replaced, not merged: blockers describe why this attempt failed. Keeping a
+	// stale holder after the failure reason has changed would point a reader at an
+	// object that no longer has anything to do with the request.
+	claim.Status.Blockers = blockers
 	apimeta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
 		Type:               ipamv1alpha1.ConditionReady,
 		Status:             metav1.ConditionFalse,
@@ -285,6 +332,10 @@ func (r *IPRequestReconciler) fail(ctx context.Context, original, claim *ipamv1a
 func (r *IPRequestReconciler) bind(ctx context.Context, original, claim *ipamv1alpha1.IPRequest, addr netip.Addr, message string) error {
 	claim.Status.Phase = ipamv1alpha1.IPRequestPhaseBound
 	claim.Status.AssignedIP = addr.String()
+	// A bound claim has nothing blocking it. Cleared here rather than in fail, so
+	// the transition from "held by someone else" to "bound" cannot leave the old
+	// blocker list behind for a reader to misread.
+	claim.Status.Blockers = nil
 	apimeta.SetStatusCondition(&claim.Status.Conditions, metav1.Condition{
 		Type:               ipamv1alpha1.ConditionReady,
 		Status:             metav1.ConditionTrue,
@@ -303,14 +354,20 @@ func (r *IPRequestReconciler) bind(ctx context.Context, original, claim *ipamv1a
 	return patchStatusIfChanged(ctx, r.Client, original, claim, original.Status, claim.Status)
 }
 
-// claimsForPool maps a pool to the claims that reference it.
+// claimsForPool maps a pool -- or a block drawn from one -- to the claims that
+// reference the same pool.
 //
-// This is the useful direction of the pool/claim dependency: fixing a pool — a
-// widened band, a template added — is what unblocks claims that previously failed
-// with RangeExhausted or TemplateMissing. Without it the fix would appear to do
-// nothing until each claim was touched by hand.
+// This is the useful direction of both dependencies. Fixing a pool — a widened
+// band, a template added — is what unblocks claims that previously failed with
+// RangeExhausted or TemplateMissing, and deleting a range request is what returns
+// capacity to a claim that failed the same way. Without the watch the fix would
+// appear to do nothing until each claim was touched by hand.
+//
+// Enqueueing is all this does; it never writes. A watch that wrote to the objects
+// it watches would be a feedback loop, and a claim that fails again simply
+// re-reports the same condition, which patchStatusIfChanged then skips writing.
 func (r *IPRequestReconciler) claimsForPool(ctx context.Context, obj client.Object) []reconcile.Request {
-	pool, ok := obj.(*ipamv1alpha1.IPPool)
+	poolRef, ok := poolRefOf(obj)
 	if !ok {
 		return nil
 	}
@@ -319,14 +376,14 @@ func (r *IPRequestReconciler) claimsForPool(ctx context.Context, obj client.Obje
 	if err := r.List(ctx, &claims); err != nil {
 		// Nothing to do but wait for the next pool event: a map function has nowhere
 		// to report an error, and returning nil simply enqueues nothing.
-		ctrl.LoggerFrom(ctx).Error(err, "listing IPRequests for pool", "pool", pool.Name)
+		ctrl.LoggerFrom(ctx).Error(err, "listing IPRequests for pool", "pool", poolRef)
 		return nil
 	}
 
 	var reqs []reconcile.Request
 	for i := range claims.Items {
 		claim := &claims.Items[i]
-		if claim.Spec.PoolRef != pool.Name {
+		if claim.Spec.PoolRef != poolRef {
 			continue
 		}
 		reqs = append(reqs, reconcile.Request{NamespacedName: types.NamespacedName{
@@ -357,6 +414,24 @@ func (r *IPRequestReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		// rather than noticed later (design R4).
 		Owns(newNAD("", "")).
 		Watches(&ipamv1alpha1.IPPool{}, handler.EnqueueRequestsFromMapFunc(r.claimsForPool)).
+		// A deleted block returns capacity, which is the only event that can unstick a
+		// claim failed with RangeExhausted. Note this is the *claim* side: a block
+		// appearing later can never invalidate a bound claim, because a claim holds
+		// its address stickily and the block allocator sees it in the ledger.
+		Watches(&ipamv1alpha1.IPRangeRequest{}, handler.EnqueueRequestsFromMapFunc(r.claimsForPool)).
+		// A deleted claim frees its address, which is what a *different* claim failed
+		// with RangeExhausted — or an Exact request blocked by it — is waiting for.
+		// For's own handler only enqueues the object being deleted, which finds
+		// nothing and returns; the waiters have to be named explicitly. Delete-only
+		// rather than every event, because a claim's status updates say nothing about
+		// any other claim's capacity.
+		Watches(&ipamv1alpha1.IPRequest{}, handler.Funcs{
+			DeleteFunc: func(ctx context.Context, e event.TypedDeleteEvent[client.Object], q workqueue.TypedRateLimitingInterface[reconcile.Request]) {
+				for _, req := range r.claimsForPool(ctx, e.Object) {
+					q.Add(req)
+				}
+			},
+		}).
 		Named("iprequest").
 		Complete(r)
 }

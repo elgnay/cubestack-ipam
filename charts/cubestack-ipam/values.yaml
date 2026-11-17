@@ -45,6 +45,33 @@ rbac:
   # before handing them out.
   helperRoles: true
 
+# L2 underlay injection for VirtualMachinePool members.
+#
+# A pool hands every member the SAME spec.virtualMachineTemplate, and
+# multus.networkName there is one literal string -- so at replicas: 2 member -1
+# names member 0's NAD and, on a `static` pool, both come up on one address.
+# Nothing in the API refuses that. This installs a MutatingAdmissionPolicy that
+# rewrites the reference per member at admission time, deriving
+# <namespace>/<vm-name>-static from the object being created. The member is correct
+# before it is ever stored, so nothing has to write it afterwards and controller #2
+# stays create-only.
+#
+# Needs Kubernetes 1.34+ with the MutatingAdmissionPolicy gate on; 1.36 turns it on
+# by default. Where the gate is off the objects are skipped rather than rendered as
+# something the API server would reject -- the install notes say which happened.
+map:
+  enabled: true
+  # The namespaces the policy applies to. It is a cluster-scoped, failurePolicy: Fail
+  # policy, so this list IS the blast radius: a CEL error on a VM in a listed
+  # namespace rejects the VM rather than admitting it unmodified. Keep it to the
+  # namespaces that actually use pool claims.
+  #
+  # Empty is an error rather than "every namespace". Widening a Fail policy to the
+  # whole cluster should be a decision someone wrote down, not a side effect of an
+  # empty list.
+  namespaces:
+    - default
+
 serviceAccount:
   # Set false to reuse an existing ServiceAccount; name is then required.
   create: true

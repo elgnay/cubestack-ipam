@@ -14,11 +14,75 @@ type: application
 # version is the chart's own version; appVersion is the default image tag. Bump
 # `version` for any chart change, `appVersion` when the image moves.
 #
+# 0.5.0 lets a caller name the address or band it wants. `IPRequest` and
+# `IPRangeRequest` grow spec.allocation (strategy Auto or Exact); Exact binds the
+# named address(es) or fails with a structured status.blockers, never substituting
+# another. IPPool grows allocation.allowExact and allocation.exclude, and the VM
+# controller reads a new ipam.cubestack.io/address annotation.
+#
+# This is a BREAKING API change, and it needs the CRDs applied BEFORE the upgrade:
+#
+#   - IPRangeRequest.spec.count is gone. It moved to spec.allocation.count, and
+#     spec.allocation is now required. A bound block is retained as-is, because the
+#     block is never re-derived from its spec; an unbound one has no allocation to
+#     read and reports AllocationInvalid. Existing IPRangeRequest objects also
+#     cannot be updated under the new schema (the old top-level count is pruned and
+#     allocation is required), so deleting and re-creating an unbound block is the
+#     only way to convert it.
+#   - IPRequest.spec.allocation is optional (absent means Auto), so existing claims
+#     keep their meaning. The whole allocation block is CEL-immutable, as is
+#     spec.poolRef.
+#   - IPPool.spec.allocation is optional; absent means allowExact: true and no
+#     exclusions, which is the behaviour every pool had before it existed.
+#
+# The manager binary changes (both allocators, the shared ledger, the VM
+# controller), so the image must be rebuilt and pushed, not just the chart bumped.
+#
+# 0.4.1 fixes event delivery, which was broken for the whole operator and not just
+# for 0.4.0. Manager.GetEventRecorder writes the events.k8s.io API group, but every
+# RBAC marker granted the core "" group instead -- so the API server rejected each
+# event ("cannot create resource events in API group events.k8s.io") and the
+# broadcaster dropped it, while the reconciles themselves succeeded and looked
+# healthy. No event this operator has ever emitted reached the cluster: not the audit
+# sweep's DuplicateAddress / OrphanedNAD / PoolDeleted, not the VM controller's
+# ignored-annotation warning, not 0.4.0's RangeReleased.
+#
+# That matters most on a `static` pool, where the audit sweep is documented as the
+# ONLY detector of a silent duplicate address. It was still logging; it was not
+# reporting. The fix is one RBAC group, so this release changes the manager binary
+# and the ClusterRole -- the image must be rebuilt, and a `helm upgrade` alone is not
+# enough because the role is part of the chart.
+#
+# 0.4.0 adds a third kind, IPRangeRequest: a user-scope request for a block of N
+# contiguous addresses drawn from an existing pool. Unlike 0.3.0 this is NOT a
+# chart-only release -- the manager binary changes (a new reconciler, a ledger that
+# reads both request kinds, two new audit findings), so the image must be rebuilt and
+# pushed, not just the chart bumped.
+#
+# Two schema changes ride along, and because Helm never upgrades crds/ both need
+# `kubectl apply -f charts/cubestack-ipam/crds/` BEFORE `helm upgrade`:
+#
+#   - the new IPRangeRequest CRD, without which the kind simply does not exist;
+#   - IPRequest.spec.poolRef, which is now CEL-immutable. Applying the CRD first is
+#     what enforces that on existing objects; skipping it leaves old objects editable
+#     under the old schema, and the ledger assumes they are not.
+#
+# Read the README's deletion section before handing anyone write access to
+# IPRangeRequest. Deleting one frees its addresses immediately, and nothing
+# reconfigures whatever was configured with them.
+#
+# 0.3.0 adds the per-member L2 injection policy (map.enabled, default true) and the
+# `ipam.cubestack.io/nad-name` override support that goes with it. It is a chart-only
+# release: the manager binary is unchanged from 0.2.0. The policy is scoped by
+# map.namespaces and needs a cluster that serves MutatingAdmissionPolicy -- read the
+# README section before upgrading, because on a cluster that does not serve it the
+# upgrade fails rather than skipping.
+#
 # 0.2.0 adds nadTemplate.ipam to the IPPool schema. Because Helm never upgrades
 # crds/, this release must be applied with `kubectl apply -f charts/cubestack-ipam/crds/`
 # before `helm upgrade`, or the new field is silently pruned by the old schema.
-version: 0.2.0
-appVersion: "0.2.0"
+version: 0.5.0
+appVersion: "0.5.0"
 
 keywords:
   - kubevirt

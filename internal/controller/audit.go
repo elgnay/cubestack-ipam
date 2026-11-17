@@ -82,6 +82,16 @@ func (f Finding) ref() *unstructured.Unstructured {
 // It reports by event and log, and deliberately writes no status. A condition is
 // owned by whichever reconciler serves that object; a second writer would race it,
 // and the audit's job is to be the check on the reconcilers, not another of them.
+//
+// # What the sweep cannot see
+//
+// A range request that was deleted while something outside the cluster was still
+// configured with its addresses is invisible here, and no check can be added to
+// find it. The object is gone, and nothing records what it used to hold — that is
+// the direct consequence of making deletion the release mechanism, which is
+// documented on IPRangeRequestSpec. The case surfaces only as its consequence: a
+// later holder landing on an address the stale consumer is still using, which is
+// exactly what addressInBlock and rangeOverlap report.
 type Auditor struct {
 	Client   client.Client
 	Recorder recorder.EventRecorder
@@ -142,13 +152,19 @@ func (a *Auditor) RunOnce(ctx context.Context) ([]Finding, error) {
 		return nil, err
 	}
 
-	// Listed once and shared by the two checks that need it. They ask different
+	// Listed once and shared by the checks that need it. They ask different
 	// questions of the same set -- which pools exist, and how each one addresses its
 	// claims -- and a second List would only invite the two answers to disagree.
 	pools, err := a.listPools(ctx)
 	if err != nil {
 		return nil, err
 	}
+
+	blocks, err := a.listRangeRequests(ctx)
+	if err != nil {
+		return nil, err
+	}
+	held := blocksByPool(blocks)
 
 	orphans, err := a.orphanedNADs(ctx, claims)
 	if err != nil {
@@ -158,6 +174,8 @@ func (a *Auditor) RunOnce(ctx context.Context) ([]Finding, error) {
 
 	findings = append(findings, a.duplicateAddresses(claims, pools)...)
 	findings = append(findings, a.danglingPoolRefs(claims, pools)...)
+	findings = append(findings, a.addressInBlock(claims, held, pools)...)
+	findings = append(findings, a.rangeOverlap(held, pools)...)
 
 	return findings, nil
 }
@@ -192,6 +210,20 @@ func (a *Auditor) listClaims(ctx context.Context) ([]ipamv1alpha1.IPRequest, err
 		return nil, fmt.Errorf("listing IPRequests: %w", err)
 	}
 	return claims.Items, nil
+}
+
+// This marker is redundant with the range controller's, which already asks for the
+// same verbs on the same resource. It is here so the sweep states its own needs:
+// delete that controller and the RBAC it contributes goes with it, and the sweep
+// would silently lose the ability to list blocks rather than fail to build.
+//
+// +kubebuilder:rbac:groups=ipam.cubestack.io,resources=iprangerequests,verbs=get;list;watch
+func (a *Auditor) listRangeRequests(ctx context.Context) ([]ipamv1alpha1.IPRangeRequest, error) {
+	var blocks ipamv1alpha1.IPRangeRequestList
+	if err := a.Client.List(ctx, &blocks); err != nil {
+		return nil, fmt.Errorf("listing IPRangeRequests: %w", err)
+	}
+	return blocks.Items, nil
 }
 
 // orphanedNADs finds NADs carrying this project's label whose claim is gone.
@@ -243,7 +275,7 @@ func (a *Auditor) orphanedNADs(ctx context.Context, claims []ipamv1alpha1.IPRequ
 
 // duplicateAddresses finds two claims in one pool holding the same address.
 //
-// This is the residue of the allocation race documented in takenAddresses. Its
+// This is the residue of the allocation race documented in takenInPool. Its
 // severity depends on the pool's mode, which is why the message says which one
 // applies rather than describing a fixed consequence:
 //
@@ -325,6 +357,194 @@ func duplicateConsequence(pools map[string]ipamv1alpha1.IPPool, poolName string)
 	}
 	return "this pool leases from Whereabouts, so only one can hold it at CNI ADD and " +
 		"the others' VMs will not start"
+}
+
+// blockHold is one request's block, as an inclusive band.
+//
+// The band is kept rather than the expanded address set, because every question
+// asked of a block here -- does this address fall inside it, do these two blocks
+// intersect, where do they intersect -- is answered by comparing two bounds, and
+// the set would be up to 65536 values per block to answer them.
+type blockHold struct {
+	req   *ipamv1alpha1.IPRangeRequest
+	start netip.Addr
+	end   netip.Addr
+}
+
+// covers reports whether addr lies within the block.
+func (h blockHold) covers(addr netip.Addr) bool {
+	return h.start.Compare(addr) <= 0 && addr.Compare(h.end) <= 0
+}
+
+// blocksByPool groups the blocks that hold addresses, keyed by pool name.
+//
+// A block whose status does not parse, or which is recorded half-way, is skipped:
+// it names no addresses, so there is nothing to compare, and its own reconciler
+// already reports it as RangeInvalid. Skipping is not the same as ignoring — the
+// claim-side check below would be the wrong place to report a broken status.
+func blocksByPool(blocks []ipamv1alpha1.IPRangeRequest) map[string][]blockHold {
+	out := map[string][]blockHold{}
+	for i := range blocks {
+		block := &blocks[i]
+		held, ok, err := heldBlock(block)
+		if err != nil || !ok {
+			continue
+		}
+		out[block.Spec.PoolRef] = append(out[block.Spec.PoolRef], blockHold{
+			req:   block,
+			start: held.start,
+			end:   held.end,
+		})
+	}
+	return out
+}
+
+// addressInBlock finds a claim whose address falls inside a block drawn from the
+// same pool.
+//
+// This is the finding the whole delegated-block feature is riskiest for, because
+// it is the one collision nothing downstream refuses. On a whereabouts pool the
+// CNI knows only about the claim's one-address NAD; it has never heard of the
+// block, which exists only as a record in this API and as configuration somewhere
+// outside the cluster. So there is no second ADD to refuse and no failed start to
+// explain — the address is simply in use twice.
+//
+// It should not be reachable through the controllers: the allocators share
+// takenInPool precisely so a claim cannot land inside a block. A finding here means
+// either that the allocation race documented on takenInPool was lost, or that
+// somebody wrote status by hand. Both are worth knowing about, and nothing else
+// will tell you.
+func (a *Auditor) addressInBlock(claims []ipamv1alpha1.IPRequest, held map[string][]blockHold, pools map[string]ipamv1alpha1.IPPool) []Finding {
+	var findings []Finding
+
+	for i := range claims {
+		claim := &claims[i]
+		addr := strings.TrimSpace(claim.Status.AssignedIP)
+		if addr == "" {
+			continue
+		}
+		parsed, err := netip.ParseAddr(addr)
+		if err != nil {
+			// Nothing can be concluded about an unparseable address; the claim's own
+			// condition says so.
+			continue
+		}
+
+		for _, hold := range held[claim.Spec.PoolRef] {
+			if !hold.covers(parsed) {
+				continue
+			}
+			claimRef := claim.Namespace + "/" + claim.Name
+			blockRef := hold.req.Namespace + "/" + hold.req.Name
+			message := fmt.Sprintf("address %s in pool %s is held by IPRequest %s and lies inside the block %s-%s held by IPRangeRequest %s; %s",
+				parsed, claim.Spec.PoolRef, claimRef, hold.start, hold.end, blockRef,
+				blockOverlapConsequence(pools, claim.Spec.PoolRef))
+
+			// Reported on both holders. Neither one's own status shows anything wrong
+			// — the claim is Bound with an address the allocator gave it, and the block
+			// is Bound with the range it was given — so a reader looking at either has
+			// to be told about the other.
+			findings = append(findings,
+				Finding{
+					GVK:       ipamv1alpha1.GroupVersion.WithKind("IPRequest"),
+					Namespace: claim.Namespace,
+					Name:      claim.Name,
+					Reason:    "AddressInBlock",
+					Message:   message,
+				},
+				Finding{
+					GVK:       ipamv1alpha1.GroupVersion.WithKind("IPRangeRequest"),
+					Namespace: hold.req.Namespace,
+					Name:      hold.req.Name,
+					Reason:    "AddressInBlock",
+					Message:   message,
+				})
+		}
+	}
+
+	sortFindings(findings)
+	return findings
+}
+
+// rangeOverlap finds two blocks drawn from one pool whose addresses intersect.
+//
+// The block-vs-block residue of the same allocation race. It is reported on both
+// requests rather than once, for the reason duplicateAddresses gives: whichever
+// one a reader is looking at should say what is wrong with it.
+//
+// The overlap is named as a band because the intersection of two contiguous blocks
+// is contiguous, so two bounds state it exactly.
+func (a *Auditor) rangeOverlap(held map[string][]blockHold, pools map[string]ipamv1alpha1.IPPool) []Finding {
+	var findings []Finding
+
+	for pool, holds := range held {
+		for i := 0; i < len(holds); i++ {
+			for j := i + 1; j < len(holds); j++ {
+				lo, hi, overlap := intersect(holds[i], holds[j])
+				if !overlap {
+					continue
+				}
+
+				aRef := holds[i].req.Namespace + "/" + holds[i].req.Name
+				bRef := holds[j].req.Namespace + "/" + holds[j].req.Name
+				message := fmt.Sprintf("block %s-%s held by IPRangeRequest %s and block %s-%s held by IPRangeRequest %s overlap on %s-%s in pool %s; %s",
+					holds[i].start, holds[i].end, aRef, holds[j].start, holds[j].end, bRef, lo, hi, pool,
+					blockOverlapConsequence(pools, pool))
+
+				for _, hold := range []blockHold{holds[i], holds[j]} {
+					findings = append(findings, Finding{
+						GVK:       ipamv1alpha1.GroupVersion.WithKind("IPRangeRequest"),
+						Namespace: hold.req.Namespace,
+						Name:      hold.req.Name,
+						Reason:    "RangeOverlap",
+						Message:   message,
+					})
+				}
+			}
+		}
+	}
+
+	sortFindings(findings)
+	return findings
+}
+
+// intersect returns the band two blocks share.
+func intersect(a, b blockHold) (lo, hi netip.Addr, overlap bool) {
+	lo = a.start
+	if b.start.Compare(lo) > 0 {
+		lo = b.start
+	}
+	hi = a.end
+	if b.end.Compare(hi) < 0 {
+		hi = b.end
+	}
+	if lo.Compare(hi) > 0 {
+		return netip.Addr{}, netip.Addr{}, false
+	}
+	return lo, hi, true
+}
+
+// blockOverlapConsequence explains what an overlap involving a delegated block
+// actually does, in the same mode-aware spirit as duplicateConsequence -- and it
+// is a separate function because the answer is genuinely different.
+//
+// duplicateConsequence can lean on the CNI refusing a second holder for the same
+// address. That reasoning does not transfer: a block is not CNI state at all, so
+// there is no second ADD for Whereabouts to refuse and nothing that has ever heard
+// of the block. Saying "the other VM will not start" here would be false, and
+// false reassurance is worse than none.
+func blockOverlapConsequence(pools map[string]ipamv1alpha1.IPPool, poolName string) string {
+	pool, known := pools[poolName]
+	if !known {
+		return "the pool no longer exists, so neither holder is arbitrated by anything"
+	}
+	if poolIPAMMode(&pool) == ipam.IPAMStatic {
+		return "this pool addresses statically, so nothing refuses the duplicate: the VM and whatever was " +
+			"configured with the block are both using the address, and the symptom is intermittent " +
+			"connectivity rather than a failed start"
+	}
+	return "this pool leases from Whereabouts, which arbitrates only the VM's own claim and does not know " +
+		"the block exists, so it will hand the address out again while the block's consumer is still using it"
 }
 
 // danglingPoolRefs finds claims left behind by a deleted pool.

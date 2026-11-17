@@ -148,6 +148,147 @@ var _ = Describe("IPPool schema validation", func() {
 		}
 		Expect(k8sClient.Create(ctx, ipReq)).NotTo(Succeed())
 	})
+
+	It("rejects a change to an IPRequest's poolRef", func() {
+		// Retrofitted when the block API made the same rule necessary there, and it
+		// reinforces an invariant the ledger already rested on: a claim's address
+		// belongs to the pool it was allocated from. Re-pointing the reference would
+		// free that address in the old pool while the NAD minted for the claim still
+		// carried it.
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec:       ipamv1alpha1.IPRequestSpec{PoolRef: "one-pool"},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, ipReq) })
+
+		ipReq.Spec.PoolRef = "another-pool"
+		err := k8sClient.Update(ctx, ipReq)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("poolRef is immutable"))
+	})
+
+	It("accepts a pool with an allocation policy", func() {
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) {
+			s.Allocation = &ipamv1alpha1.PoolAllocation{
+				Exclude: []ipamv1alpha1.IPRange{{Start: "10.66.3.150", End: "10.66.3.159"}},
+			}
+		})
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pool) })
+	})
+
+	It("accepts a pool that forbids exact allocation", func() {
+		allow := false
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) {
+			s.Allocation = &ipamv1alpha1.PoolAllocation{AllowExact: &allow}
+		})
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pool) })
+	})
+
+	It("defaults allowExact to true", func() {
+		// The default is the feature being available without every pool opting in.
+		// Asserted through the API server so it is the CRD's default, not a Go
+		// fallback that a hand-written object would not get.
+		pool := newPool(func(s *ipamv1alpha1.IPPoolSpec) {
+			s.Allocation = &ipamv1alpha1.PoolAllocation{}
+		})
+		Expect(k8sClient.Create(ctx, pool)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, pool) })
+
+		stored := &ipamv1alpha1.IPPool{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(pool), stored)).To(Succeed())
+		Expect(stored.Spec.Allocation.AllowExact).NotTo(BeNil())
+		Expect(*stored.Spec.Allocation.AllowExact).To(BeTrue())
+	})
+
+	It("accepts an IPRequest that asks for a specific address", func() {
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec: ipamv1alpha1.IPRequestSpec{
+				PoolRef: "any-pool",
+				Allocation: &ipamv1alpha1.AddressAllocation{
+					Strategy: ipamv1alpha1.AllocationExact,
+					Address:  "10.66.3.160",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, ipReq) })
+	})
+
+	It("accepts an IPRequest with no allocation block", func() {
+		// The backward-compatibility case: objects created before the field existed,
+		// and hand-written claims that just want the lowest free address.
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec:       ipamv1alpha1.IPRequestSpec{PoolRef: "any-pool"},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, ipReq) })
+	})
+
+	It("rejects an Exact IPRequest with no address", func() {
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec: ipamv1alpha1.IPRequestSpec{
+				PoolRef:    "any-pool",
+				Allocation: &ipamv1alpha1.AddressAllocation{Strategy: ipamv1alpha1.AllocationExact},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).NotTo(Succeed())
+	})
+
+	It("rejects an Auto IPRequest that carries an address", func() {
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec: ipamv1alpha1.IPRequestSpec{
+				PoolRef: "any-pool",
+				Allocation: &ipamv1alpha1.AddressAllocation{
+					Strategy: ipamv1alpha1.AllocationAuto,
+					Address:  "10.66.3.160",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).NotTo(Succeed())
+	})
+
+	It("rejects a requested address that is not an IPv4 address", func() {
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec: ipamv1alpha1.IPRequestSpec{
+				PoolRef: "any-pool",
+				Allocation: &ipamv1alpha1.AddressAllocation{
+					Strategy: ipamv1alpha1.AllocationExact,
+					Address:  "not-an-ip",
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).NotTo(Succeed())
+	})
+
+	It("rejects a change to an IPRequest's allocation", func() {
+		ipReq := &ipamv1alpha1.IPRequest{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "schema-check-", Namespace: "default"},
+			Spec: ipamv1alpha1.IPRequestSpec{
+				PoolRef: "any-pool",
+				Allocation: &ipamv1alpha1.AddressAllocation{
+					Strategy: ipamv1alpha1.AllocationAuto,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, ipReq)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, ipReq) })
+
+		ipReq.Spec.Allocation = &ipamv1alpha1.AddressAllocation{
+			Strategy: ipamv1alpha1.AllocationExact,
+			Address:  "10.66.3.160",
+		}
+		err := k8sClient.Update(ctx, ipReq)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("allocation is immutable"))
+	})
 })
 
 // The samples in config/samples are what a user copies first, so a broken one is
@@ -161,6 +302,7 @@ var _ = Describe("Shipped samples", func() {
 		"../../config/samples/ipam_v1alpha1_ippool.yaml",
 		"../../config/samples/ipam_v1alpha1_ippool_minimal.yaml",
 		"../../config/samples/ipam_v1alpha1_iprequest.yaml",
+		"../../config/samples/ipam_v1alpha1_iprangerequest.yaml",
 		"../../config/samples/kubevirt_v1_virtualmachine.yaml",
 	} {
 		It("satisfies the schema: "+path, func() {
@@ -171,6 +313,11 @@ var _ = Describe("Shipped samples", func() {
 			switch {
 			case strings.Contains(string(raw), "kind: IPPool"):
 				obj = &ipamv1alpha1.IPPool{}
+			// Checked before IPRequest, whose substring it would otherwise be
+			// mistaken for by a reader -- though not, as it happens, by this switch:
+			// "kind: IPRequest" is not a substring of "kind: IPRangeRequest".
+			case strings.Contains(string(raw), "kind: IPRangeRequest"):
+				obj = &ipamv1alpha1.IPRangeRequest{}
 			case strings.Contains(string(raw), "kind: IPRequest"):
 				obj = &ipamv1alpha1.IPRequest{}
 			case strings.Contains(string(raw), "kind: VirtualMachine"):

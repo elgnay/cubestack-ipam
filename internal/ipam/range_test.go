@@ -195,3 +195,213 @@ func TestFirstFree_EmptyBand(t *testing.T) {
 		t.Errorf("an empty band must report exhaustion, got %s", got)
 	}
 }
+
+func TestFirstFreeRun(t *testing.T) {
+	band, err := ParseRange("10.66.3.150", "10.66.3.157")
+	if err != nil {
+		t.Fatalf("parsing the test band: %v", err)
+	}
+
+	taken := func(addrs ...string) map[netip.Addr]struct{} {
+		set := make(map[netip.Addr]struct{}, len(addrs))
+		for _, a := range addrs {
+			set[netip.MustParseAddr(a)] = struct{}{}
+		}
+		return set
+	}
+
+	tests := []struct {
+		name      string
+		taken     map[netip.Addr]struct{}
+		n         int
+		wantStart string
+		wantEnd   string
+		wantFound bool
+	}{
+		{
+			name:      "empty ledger yields the lowest run",
+			taken:     taken(),
+			n:         3,
+			wantStart: "10.66.3.150",
+			wantEnd:   "10.66.3.152",
+			wantFound: true,
+		},
+		{
+			name:      "exact fit at the top of the band",
+			taken:     taken("10.66.3.150", "10.66.3.151", "10.66.3.152", "10.66.3.153"),
+			n:         4,
+			wantStart: "10.66.3.154",
+			wantEnd:   "10.66.3.157",
+			wantFound: true,
+		},
+		{
+			// The whole point of "run" over "count": a free address that cannot be
+			// part of a long-enough run must not be handed out.
+			name:      "a gap too small to satisfy n is skipped for a later run",
+			taken:     taken("10.66.3.151", "10.66.3.152", "10.66.3.153"),
+			n:         3,
+			wantStart: "10.66.3.154",
+			wantEnd:   "10.66.3.156",
+			wantFound: true,
+		},
+		{
+			name:      "a taken address splits a run",
+			taken:     taken("10.66.3.152"),
+			n:         3,
+			wantStart: "10.66.3.153",
+			wantEnd:   "10.66.3.155",
+			wantFound: true,
+		},
+		{
+			// Lowest-first, not best-fit: a longer run further up the band must not
+			// outrank a shorter one that starts lower. Determinism is the reason.
+			name:      "the lowest sufficient run wins over a longer later one",
+			taken:     taken("10.66.3.152", "10.66.3.153"),
+			n:         2,
+			wantStart: "10.66.3.150",
+			wantEnd:   "10.66.3.151",
+			wantFound: true,
+		},
+		{
+			name:      "n of one degenerates to FirstFree",
+			taken:     taken("10.66.3.150"),
+			n:         1,
+			wantStart: "10.66.3.151",
+			wantEnd:   "10.66.3.151",
+			wantFound: true,
+		},
+		{
+			name:      "a full band has no run",
+			taken:     taken("10.66.3.150", "10.66.3.151", "10.66.3.152", "10.66.3.153", "10.66.3.154", "10.66.3.155", "10.66.3.156", "10.66.3.157"),
+			n:         1,
+			wantFound: false,
+		},
+		{
+			name:      "free addresses fragmented below n have no qualifying run",
+			taken:     taken("10.66.3.151", "10.66.3.153", "10.66.3.155", "10.66.3.157"),
+			n:         2,
+			wantFound: false,
+		},
+		{
+			name:      "n larger than the band",
+			taken:     taken(),
+			n:         9,
+			wantFound: false,
+		},
+		{
+			// A request for nothing is not a run of nothing. Reporting ok would
+			// hand the caller a zero netip.Addr to write into a status.
+			name:      "n of zero is not satisfiable",
+			taken:     taken(),
+			n:         0,
+			wantFound: false,
+		},
+		{
+			name:      "negative n is not satisfiable",
+			taken:     taken(),
+			n:         -1,
+			wantFound: false,
+		},
+		{
+			// Addresses outside the band are none of this pool's business, the same
+			// rule FirstFree follows.
+			name:      "addresses outside the band are ignored",
+			taken:     taken("10.66.3.149", "10.66.3.158"),
+			n:         2,
+			wantStart: "10.66.3.150",
+			wantEnd:   "10.66.3.151",
+			wantFound: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			start, end, found := FirstFreeRun(band, tt.taken, tt.n)
+			if found != tt.wantFound {
+				t.Fatalf("found = %v, want %v", found, tt.wantFound)
+			}
+			if !tt.wantFound {
+				return
+			}
+			if start.String() != tt.wantStart || end.String() != tt.wantEnd {
+				t.Errorf("got %s-%s, want %s-%s", start, end, tt.wantStart, tt.wantEnd)
+			}
+		})
+	}
+}
+
+func TestFirstFreeRun_SingleAddressBand(t *testing.T) {
+	band, err := ParseRange("10.66.3.150", "10.66.3.150")
+	if err != nil {
+		t.Fatalf("parsing the test band: %v", err)
+	}
+
+	if start, end, found := FirstFreeRun(band, nil, 1); !found || start.String() != "10.66.3.150" || end.String() != "10.66.3.150" {
+		t.Errorf("a free one-address band must yield 10.66.3.150-10.66.3.150, got %s-%s found=%v", start, end, found)
+	}
+	if _, _, found := FirstFreeRun(band, map[netip.Addr]struct{}{netip.MustParseAddr("10.66.3.150"): {}}, 1); found {
+		t.Error("a taken one-address band must report no run")
+	}
+	if _, _, found := FirstFreeRun(band, nil, 2); found {
+		t.Error("a one-address band cannot satisfy n=2")
+	}
+}
+
+func TestFirstFreeRun_EmptyBand(t *testing.T) {
+	// Same reasoning as TestFirstFree_EmptyBand: not a legitimate pool, but the
+	// primitive must report rather than panic on the zero value.
+	if _, _, found := FirstFreeRun(nil, nil, 1); found {
+		t.Error("an empty band must report no run")
+	}
+	if got := LongestFreeRun(nil, nil); got != 0 {
+		t.Errorf("an empty band has no run, got %d", got)
+	}
+}
+
+func TestLongestFreeRun(t *testing.T) {
+	band, err := ParseRange("10.66.3.150", "10.66.3.157")
+	if err != nil {
+		t.Fatalf("parsing the test band: %v", err)
+	}
+
+	taken := func(addrs ...string) map[netip.Addr]struct{} {
+		set := make(map[netip.Addr]struct{}, len(addrs))
+		for _, a := range addrs {
+			set[netip.MustParseAddr(a)] = struct{}{}
+		}
+		return set
+	}
+
+	tests := []struct {
+		name  string
+		taken map[netip.Addr]struct{}
+		want  int
+	}{
+		{name: "an empty ledger leaves the whole band", taken: taken(), want: 8},
+		{name: "a full band has no run", taken: taken("10.66.3.150", "10.66.3.151", "10.66.3.152", "10.66.3.153", "10.66.3.154", "10.66.3.155", "10.66.3.156", "10.66.3.157"), want: 0},
+		{name: "reports the longest, not the first", taken: taken("10.66.3.150"), want: 7},
+		{name: "reports the longest, not the last", taken: taken("10.66.3.157"), want: 7},
+		// This is the fragmentation diagnosis the failure message depends on: two
+		// free addresses exist, but neither n=2 run is where the caller looked.
+		{name: "fragmented free addresses", taken: taken("10.66.3.150", "10.66.3.152", "10.66.3.153", "10.66.3.155", "10.66.3.156", "10.66.3.157"), want: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := LongestFreeRun(band, tt.taken); got != tt.want {
+				t.Errorf("got %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestMaxRangeSize pins the exported cap against the literal in the CRD marker on
+// IPRangeRequest.spec.allocation.count. A marker cannot reference a Go constant, so the two
+// are necessarily duplicated; this fails loudly if this side moves without the
+// schema. The schema side is pinned by the "rejects a count above the range
+// ceiling" spec in the controller suite, which also pins the boundary itself.
+func TestMaxRangeSize(t *testing.T) {
+	if MaxRangeSize != 65536 {
+		t.Fatalf("MaxRangeSize is %d; the IPRangeRequest.spec.allocation.count Maximum marker says 65536 and must be updated with it", MaxRangeSize)
+	}
+}

@@ -40,6 +40,10 @@ import (
 // subnet or a gateway. Everything the minted config contains lives in the
 // template, and is required exactly when the template is present.
 //
+// spec.allocation is the admin's policy for that allocator: bands it must never
+// hand out, and whether callers may name the address they want. It is optional and
+// omitting it allows exact requests with no exclusions.
+//
 // The range MUST be disjoint from any other NAD serving the same subnet, and
 // from the MetalLB pool if one exists on it. That is an admin responsibility
 // rather than a controller check: with the shared underlay NAD retired, there is
@@ -64,6 +68,16 @@ type IPPoolSpec struct {
 	// addresses and mints nothing, so it needs no subnet and no gateway.
 	// +required
 	Range IPRange `json:"range"`
+
+	// allocation is the admin's policy for the allocator: bands reserved from every
+	// request, and whether callers may ask for an address by name.
+	//
+	// Optional, and its absence means "exact requests allowed, nothing excluded".
+	// That default keeps the two behaviours this field governs discoverable without
+	// making every existing pool carry an empty block.
+	//
+	// +optional
+	Allocation *PoolAllocation `json:"allocation,omitempty"`
 
 	// nadTemplate is the network config cloned into every NAD this pool mints,
 	// including the addressing that config carries.
@@ -223,7 +237,13 @@ type IPRange struct {
 // but §R3 and §5.5 both state the set of IPRequests is the ONLY authoritative
 // record of who holds what. Modelling a second list would create exactly the
 // two-ledger drift §R3 warns about, so this status carries conditions only and
-// the IPRequest set is the ledger.
+// the request sets are the ledger.
+//
+// "Sets", plural, since IPRangeRequest was added: a delegated block holds its
+// addresses in status.start/status.end rather than one object per address, so
+// the ledger is the IPRequest set plus the IPRangeRequest set. Both go through
+// the single reader in internal/controller/ledger.go, which is what keeps "the
+// objects are the ledger" true rather than merely intended.
 type IPPoolStatus struct {
 	// conditions represent the current state of the IPPool resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
@@ -243,7 +263,7 @@ type IPPoolStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
-// +kubebuilder:resource:scope=Cluster
+// +kubebuilder:resource:scope=Cluster,shortName=ipp
 // +kubebuilder:printcolumn:name="Subnet",type=string,JSONPath=`.spec.nadTemplate.subnet`
 // +kubebuilder:printcolumn:name="Start",type=string,JSONPath=`.spec.range.start`
 // +kubebuilder:printcolumn:name="End",type=string,JSONPath=`.spec.range.end`

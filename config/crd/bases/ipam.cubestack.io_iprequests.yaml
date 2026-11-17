@@ -11,6 +11,8 @@ spec:
     kind: IPRequest
     listKind: IPRequestList
     plural: iprequests
+    shortNames:
+    - ipr
     singular: iprequest
   scope: Namespaced
   versions:
@@ -20,6 +22,9 @@ spec:
       type: string
     - jsonPath: .status.assignedIP
       name: Assigned
+      type: string
+    - jsonPath: .spec.allocation.address
+      name: Requested
       type: string
     - jsonPath: .spec.nad
       name: NAD
@@ -55,6 +60,50 @@ spec:
           spec:
             description: spec defines the desired state of IPRequest
             properties:
+              allocation:
+                description: |-
+                  allocation selects who chooses the address.
+
+                  Omitted means Auto: the controller takes the lowest free address in the pool.
+                  Exact requires spec.allocation.address, and the request fails rather than
+                  being given a different address if that one is out of range, excluded by the
+                  pool, or already held.
+
+                  Immutable. The address is bound to this claim and, when nad is set, written
+                  into the NAD the claim owns; changing the request would move an address out
+                  from under a running VM. Delete and recreate the claim to ask for a different
+                  one.
+                properties:
+                  address:
+                    description: |-
+                      address is the IPv4 address the caller requires. It is only meaningful with
+                      strategy Exact, and the schema requires it there and forbids it otherwise.
+
+                      The address must lie inside the pool's spec.range, outside its exclusions, and
+                      not be held by another claim or block. Anything else fails the request; it is
+                      never replaced with a nearby free address.
+                    pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                    type: string
+                  strategy:
+                    default: Auto
+                    description: strategy selects who chooses the address. Omitted
+                      means Auto.
+                    enum:
+                    - Auto
+                    - Exact
+                    type: string
+                required:
+                - strategy
+                type: object
+                x-kubernetes-validations:
+                - message: allocation.address must be set when strategy is Exact and
+                    must be absent when strategy is Auto
+                  rule: 'self.strategy == ''Exact'' ? has(self.address) : !has(self.address)'
+                - message: 'allocation is immutable: an address belongs to the claim
+                    it was bound to, and changing it would move an address out from
+                    under a running VM. Delete this claim and create a new one if
+                    you need a different allocation.'
+                  rule: self == oldSelf
               nad:
                 description: |-
                   nad optionally names the NetworkAttachmentDefinition to mint for this claim,
@@ -72,8 +121,19 @@ spec:
                 description: |-
                   poolRef names the IPPool to claim from. IPPool is cluster-scoped, so this is
                   a bare name with no namespace.
+
+                  Immutable. A claim's address is allocated against one pool's ledger, and
+                  re-pointing the reference would free that address in the old pool while
+                  anything configured with it — the minted NAD above all — kept using it. The
+                  addresses belong to a pool; moving a claim between pools is a new claim.
                 minLength: 1
                 type: string
+                x-kubernetes-validations:
+                - message: 'poolRef is immutable: a claim''s address belongs to the
+                    pool it was allocated from, and re-pointing it would free that
+                    address while the NAD minted for it still used it. Delete this
+                    claim and create a new one against the other pool.'
+                  rule: self == oldSelf
             required:
             - poolRef
             type: object
@@ -83,6 +143,62 @@ spec:
               assignedIP:
                 description: assignedIP is the address this claim holds, once bound.
                 type: string
+              blockers:
+                description: |-
+                  blockers names the holders standing in the way of an Exact request.
+
+                  Empty for Auto requests, which fail only when the pool itself is exhausted.
+                  On a failed Exact request this is the actionable half of the condition: the
+                  reason says AddressUnavailable, this says which claim or block holds the
+                  address and can be looked up directly. Cleared when the claim binds.
+                items:
+                  description: |-
+                    Blocker names one object that stands between an Exact allocation and success.
+
+                    It is deliberately structured rather than only a sentence: the usual next step
+                    is to look at the holder, delete it if it is stale, or choose another address,
+                    and a name to look up is what makes that possible. Reason strings stay on the
+                    condition; this list is the detail behind "AddressUnavailable" or
+                    "RangeUnavailable".
+                  properties:
+                    address:
+                      description: |-
+                        address is the single address the holder owns, when the blocker is an
+                        IPRequest.
+                      type: string
+                    kind:
+                      description: 'kind is the holder''s kind: IPRequest or IPRangeRequest.'
+                      type: string
+                    name:
+                      description: name is the holder's name.
+                      type: string
+                    namespace:
+                      description: namespace is the holder's namespace. Empty for
+                        cluster-scoped kinds.
+                      type: string
+                    range:
+                      description: |-
+                        range is the block the holder owns, when the blocker is an IPRangeRequest,
+                        or the pool exclusion that covers the request.
+                      properties:
+                        end:
+                          description: end is the last address in the band (inclusive).
+                          pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                          type: string
+                        start:
+                          description: start is the first address in the band (inclusive).
+                          pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                          type: string
+                      required:
+                      - end
+                      - start
+                      type: object
+                  required:
+                  - kind
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
               conditions:
                 description: |-
                   conditions represent the current state of the IPRequest resource.
@@ -91,8 +207,11 @@ spec:
                   Condition types set here:
                   - "Ready": True once an address is assigned and, if spec.nad was set, its NAD exists.
                     The cause of a False goes in the condition's reason, e.g. "RangeExhausted" or
-                    "PoolNotFound" -- there is no separate "Degraded" type, which would be its exact
-                    complement and could drift out of step with it.
+                    "PoolNotFound"; an Exact request that cannot have the address it named adds
+                    "AddressOutOfRange", "AddressExcluded", "AddressUnavailable", "ExactNotAllowed"
+                    or "AllocationInvalid", with the holders in status.blockers -- there is no
+                    separate "Degraded" type, which would be its exact complement and could drift
+                    out of step with it.
                   - "TemplateMissing": True when spec.nad is set but the pool carries no nadTemplate,
                     so no NAD can be minted. Names a misconfiguration the user can fix.
                   - "NADNameTaken": True when the name in spec.nad is already held by an object this

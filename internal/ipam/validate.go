@@ -52,6 +52,11 @@ import (
 // template that is present and incomplete, because a CRD update can admit one
 // that the old schema would not have.
 //
+// spec.allocation.exclude bands are validated here too: each must be ordered,
+// IPv4, and inside spec.range. A band outside the range reserves nothing because
+// the allocator never considers those addresses, so accepting one would give the
+// admin a reservation that silently does not exist.
+//
 // This is a pure function: no cluster access, no allocation, no side effects.
 func ValidatePoolRange(spec ipamv1alpha1.IPPoolSpec) error {
 	// Parsed explicitly rather than via a helper so each error names its own field.
@@ -68,6 +73,32 @@ func ValidatePoolRange(spec ipamv1alpha1.IPPoolSpec) error {
 	// possible in Go and impossible in CEL.
 	if start.Compare(end) > 0 {
 		return fmt.Errorf("range.start %s must not be greater than range.end %s", start, end)
+	}
+
+	// Exclusions are validated here, before the template early-return, because a
+	// ledger-only pool can declare them too — and because an exclusion outside the
+	// band is silently useless: the allocator would never look at those addresses
+	// anyway, so the admin's reservation would appear to work while reserving
+	// nothing. The schema cannot express the containment rule for the same
+	// no-ordering-overload reason as the band itself.
+	for i, band := range spec.Exclusions() {
+		exStart, err := netip.ParseAddr(band.Start)
+		if err != nil {
+			return fmt.Errorf("allocation.exclude[%d].start %q is not a valid address: %w", i, band.Start, err)
+		}
+		exEnd, err := netip.ParseAddr(band.End)
+		if err != nil {
+			return fmt.Errorf("allocation.exclude[%d].end %q is not a valid address: %w", i, band.End, err)
+		}
+		if !exStart.Is4() || !exEnd.Is4() {
+			return fmt.Errorf("allocation.exclude[%d] (%s-%s) is not IPv4; this claim layer is IPv4-only", i, exStart, exEnd)
+		}
+		if exStart.Compare(exEnd) > 0 {
+			return fmt.Errorf("allocation.exclude[%d].start %s must not be greater than its end %s", i, exStart, exEnd)
+		}
+		if exStart.Compare(start) < 0 || exEnd.Compare(end) > 0 {
+			return fmt.Errorf("allocation.exclude[%d] (%s-%s) must lie entirely within range %s-%s", i, exStart, exEnd, start, end)
+		}
 	}
 
 	if spec.NADTemplate == nil {

@@ -1,7 +1,7 @@
 cubestack-ipam {{ .Chart.AppVersion }} installed into namespace {{ .Release.Namespace }}.
 
 It is running, but it will not allocate anything until you create an IPPool. The
-pools and claims are the API; this chart only deploys the controllers.
+pools, claims and block requests are the API; this chart only deploys the controllers.
 
 THE IMAGE
 {{- if or (eq (default .Chart.AppVersion .Values.image.tag) "latest") (eq .Values.image.pullPolicy "IfNotPresent") }}
@@ -38,10 +38,61 @@ THEN: TAG A VM
   The VM will show FailedCreatePodSandBox for the few seconds between being created
   and its NAD being minted. That is expected and self-healing.
 
+ALSO: RESERVE A BLOCK
+  IPRangeRequest claims N contiguous addresses from an existing pool in one object,
+  for a consumer that needs a range rather than a single address:
+
+    kubectl get iprangerequests.ipam.cubestack.io -A     # short name: iprr
+    kubectl get iprr -n <namespace> <name> -o jsonpath='{.status.start}-{.status.end}'
+
+  Two things to know before using one. It is a reservation, not a deployment: nothing
+  here configures whatever consumes those addresses, so deleting the object frees them
+  for the next VM while that consumer keeps using them -- and on a `static` pool
+  nothing refuses the duplicate. And this chart deliberately ships no write role for
+  it, only a viewer, because that grant is worth making per team against a named pool.
+  Read the README's deletion section first.
+
 WHAT THIS DOES NOT DO
   It does not configure the guest, and it does not migrate existing VMs onto claims.
   The shared underlay NAD is not touched by this chart -- retiring it is a migration,
   not a deploy. See the README.
+
+{{- if .Values.map.enabled }}
+
+UNDERLAY INJECTION
+{{- if include "cubestack-ipam.mapAPIVersion" . }}
+  Installed. Every VirtualMachine created or updated in
+  {{ join ", " .Values.map.namespaces }} carrying the ipam.cubestack.io/pool annotation
+  gets its networks[].multus.networkName rewritten to <its own namespace>/<its own
+  name>-static at admission, so pool members no longer share one reference.
+
+    kubectl get mutatingadmissionpolicy {{ include "cubestack-ipam.fullname" . }}-vm-underlay
+    kubectl get mutatingadmissionpolicybinding {{ include "cubestack-ipam.fullname" . }}-vm-underlay
+
+  It fails closed: a VM in one of those namespaces that the expressions cannot
+  evaluate is REJECTED, not admitted unmodified. Widen `map.namespaces` only as far
+  as the namespaces that use pool claims.
+{{- else }}
+  NOT INSTALLED -- this cluster does not serve MutatingAdmissionPolicy.
+
+  On 1.32-1.35 that is just the feature gate, which is off by default; 1.36 turns it
+  on and serves the same object as v1. Nothing is broken: the controllers run, claims
+  are minted, and VMs that name their own NAD keep working. What is missing is only
+  the per-member rewrite, so a VirtualMachinePool member still takes the literal
+  networkName from spec.virtualMachineTemplate -- one reference shared by every
+  member, and on a `static` pool nothing refuses the duplicate.
+
+  To turn it on, the API server needs BOTH flags. The gate alone is not enough: it
+  starts the admission plugin, whose informers are hard-wired to the v1beta1 group
+  version that 1.35 does not serve, and the plugin then refuses every request in the
+  cluster -- including the API server's own.
+
+    --feature-gates=MutatingAdmissionPolicy=true
+    --runtime-config=admissionregistration.k8s.io/v1beta1=true
+
+  Then re-run this install. Or set map.enabled=false to stop being told about it.
+{{- end }}
+{{- end }}
 
 {{- if .Values.metrics.enabled }}
 

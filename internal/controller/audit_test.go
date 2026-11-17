@@ -189,4 +189,106 @@ var _ = Describe("Auditor", func() {
 			Expect(f.Message).NotTo(ContainSubstring("audit-healthy"))
 		}
 	})
+
+	It("reports a claim sitting inside a delegated block", func() {
+		// The collision nothing downstream refuses. On a static pool nothing refuses a
+		// duplicate at all, and neither holder's own status shows anything wrong — the
+		// claim holds an address the allocator gave it, the block holds the range it
+		// was given — so both have to be told about the other.
+		createPool("audit-inblock", testPoolSpec()) // static
+		bindClaim("default", "audit-inblock-ip", "audit-inblock", testThirdIP)
+		createRangeRequest("default", "audit-inblock-blk", "audit-inblock", 6)
+		bindRange("default", "audit-inblock-blk", testFirstIP, testSixthIP) // .150-.155, covers .152
+
+		findings := withReason(sweep(), "AddressInBlock")
+
+		claimFinding := withName(findings, "audit-inblock-ip")
+		Expect(claimFinding).To(HaveLen(1))
+		Expect(claimFinding[0].GVK.Kind).To(Equal("IPRequest"))
+		Expect(claimFinding[0].Message).To(ContainSubstring("audit-inblock-blk"))
+		Expect(claimFinding[0].Message).To(ContainSubstring(testThirdIP))
+
+		blockFinding := withName(findings, "audit-inblock-blk")
+		Expect(blockFinding).To(HaveLen(1))
+		Expect(blockFinding[0].GVK.Kind).To(Equal("IPRangeRequest"))
+		Expect(blockFinding[0].Message).To(ContainSubstring("audit-inblock-ip"))
+
+		// The block-side consequence must not be borrowed from the claim-side one.
+		// That wording promises a refused CNI ADD, which cannot happen here: a block is
+		// not CNI state, so there is no second ADD for anything to refuse.
+		Expect(claimFinding[0].Message).To(ContainSubstring("intermittent connectivity"))
+		Expect(claimFinding[0].Message).NotTo(ContainSubstring("will not start"))
+		Expect(claimFinding[0].Message).NotTo(ContainSubstring("leases from Whereabouts"))
+	})
+
+	It("does not claim the CNI will catch a whereabouts block overlap", func() {
+		// The other half of the same wording, and the one that matters most: Whereabouts
+		// arbitrates the VM's own claim and has never heard of the block, so its
+		// familiar consequence — the second ADD refused, the VM not starting — does not
+		// apply. Saying it would send a reader looking for a VM that is running fine.
+		createPool("audit-inblock-wa", testWhereaboutsPoolSpec())
+		bindClaim("default", "audit-inblock-wa-ip", "audit-inblock-wa", testThirdIP)
+		createRangeRequest("default", "audit-inblock-wa-blk", "audit-inblock-wa", 6)
+		bindRange("default", "audit-inblock-wa-blk", testFirstIP, testSixthIP)
+
+		matched := withName(withReason(sweep(), "AddressInBlock"), "audit-inblock-wa-ip")
+		Expect(matched).To(HaveLen(1))
+		Expect(matched[0].Message).To(ContainSubstring("does not know the block exists"))
+		Expect(matched[0].Message).NotTo(ContainSubstring("will not start"))
+		Expect(matched[0].Message).NotTo(ContainSubstring("intermittent connectivity"))
+	})
+
+	It("reports two blocks that overlap", func() {
+		// The block-vs-block residue of the same allocation race. Two bounds state the
+		// overlap exactly, because the intersection of two contiguous blocks is
+		// contiguous.
+		createPool("audit-overlap", testPoolSpec())
+		createRangeRequest("default", "audit-overlap-a", "audit-overlap", 4)
+		createRangeRequest("default", "audit-overlap-b", "audit-overlap", 4)
+		bindRange("default", "audit-overlap-a", testFirstIP, testFourthIP) // .150-.153
+		bindRange("default", "audit-overlap-b", testThirdIP, testSixthIP)  // .152-.155
+
+		findings := withReason(sweep(), "RangeOverlap")
+
+		a := withName(findings, "audit-overlap-a")
+		Expect(a).To(HaveLen(1))
+		Expect(a[0].Message).To(ContainSubstring("audit-overlap-b"))
+		Expect(a[0].Message).To(ContainSubstring(testThirdIP + "-" + testFourthIP))
+
+		b := withName(findings, "audit-overlap-b")
+		Expect(b).To(HaveLen(1))
+		Expect(b[0].GVK.Kind).To(Equal("IPRangeRequest"))
+		Expect(b[0].Message).To(ContainSubstring("audit-overlap-a"))
+	})
+
+	It("is quiet about a healthy mixed cluster", func() {
+		// A claim and a block sharing one pool without touching, which is the normal
+		// state this whole feature has to leave alone.
+		createPool("audit-mixed", testPoolSpec())
+		bindClaim("default", "audit-mixed-ip", "audit-mixed", testFirstIP)
+		createRangeRequest("default", "audit-mixed-blk", "audit-mixed", 3)
+		bindRange("default", "audit-mixed-blk", testFifthIP, testBlockBandEnd) // .154-.157
+
+		// Asserted first, so the negatives below cannot pass by the fixture having
+		// quietly failed to exist.
+		Expect(getRangeRequest("default", "audit-mixed-blk").Status.Start).To(Equal(testFifthIP))
+
+		findings := sweep()
+		Expect(withName(withReason(findings, "AddressInBlock"), "audit-mixed-ip")).To(BeEmpty())
+		Expect(withName(withReason(findings, "AddressInBlock"), "audit-mixed-blk")).To(BeEmpty())
+		Expect(withName(withReason(findings, "RangeOverlap"), "audit-mixed-blk")).To(BeEmpty())
+	})
+
+	It("says nothing about a block that records no addresses", func() {
+		// A request that was never bound, or whose status does not parse, names no
+		// addresses — so there is nothing for either block check to compare. Skipping
+		// it is deliberate: its own reconciler already reports it as RangeInvalid, and
+		// the audit's job here is not to say that twice.
+		createPool("audit-unbound", testPoolSpec())
+		createRangeRequest("default", "audit-unbound-block", "audit-unbound", 2)
+
+		findings := sweep()
+		Expect(withName(withReason(findings, "AddressInBlock"), "audit-unbound-block")).To(BeEmpty())
+		Expect(withName(withReason(findings, "RangeOverlap"), "audit-unbound-block")).To(BeEmpty())
+	})
 })

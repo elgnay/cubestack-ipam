@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -40,7 +41,7 @@ import (
 //
 // Handled as unstructured, and not only to avoid a vendor dependency. A typed
 // VirtualMachine would mean vendoring a large API surface of which this controller
-// reads two annotations, and every field it did not model would be a field it
+// reads three annotations, and every field it did not model would be a field it
 // could silently drop if it ever wrote the object back. It never writes the VM —
 // that is the contract below — so the typed view would be a liability with no
 // compensating safety.
@@ -81,7 +82,7 @@ type VirtualMachineReconciler struct {
 //
 // +kubebuilder:rbac:groups=kubevirt.io,resources=virtualmachines,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ipam.cubestack.io,resources=iprequests,verbs=get;list;watch;create
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// (event RBAC is declared once in events.go -- the group is events.k8s.io, not "")
 
 // Reconcile creates the IPRequest for a VirtualMachine that asks for one.
 func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
@@ -110,13 +111,15 @@ func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		nadName = ipam.DefaultNADName(vm.GetName())
 	}
 
+	allocation := desiredAllocation(vm)
+
 	claimName := vm.GetName() + claimNameSuffix
 	key := types.NamespacedName{Namespace: vm.GetNamespace(), Name: claimName}
 
 	claim := &ipamv1alpha1.IPRequest{}
 	switch err := r.Get(ctx, key, claim); {
 	case apierrors.IsNotFound(err):
-		return r.createClaim(ctx, vm, claimName, pool, nadName)
+		return r.createClaim(ctx, vm, claimName, pool, nadName, allocation)
 	case err != nil:
 		return ctrl.Result{}, fmt.Errorf("reading IPRequest %s/%s: %w", key.Namespace, key.Name, err)
 	}
@@ -130,13 +133,15 @@ func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 		return ctrl.Result{}, errors.New(msg)
 	}
 
-	if claim.Spec.PoolRef != pool || claim.Spec.NAD != nadName {
+	if claim.Spec.PoolRef != pool || claim.Spec.NAD != nadName || !sameAllocation(claim.Spec.Allocation, allocation) {
 		// The divergence a create-only controller has to explain. Emphatically not
 		// an error: the claim is doing its job with the values it was created with,
 		// and the annotation change was ignored on purpose.
-		msg := fmt.Sprintf("annotation change ignored: IPRequest %s/%s was created with pool %q and nad %q; "+
-			"delete the IPRequest to re-claim with pool %q and nad %q",
-			key.Namespace, key.Name, claim.Spec.PoolRef, claim.Spec.NAD, pool, nadName)
+		msg := fmt.Sprintf("annotation change ignored: IPRequest %s/%s was created with %s; "+
+			"delete the IPRequest to re-claim with %s",
+			key.Namespace, key.Name,
+			describeAllocation(claim.Spec.PoolRef, claim.Spec.NAD, claim.Spec.Allocation),
+			describeAllocation(pool, nadName, allocation))
 		recordEvent(r.Recorder, vm, corev1.EventTypeWarning, "ClaimExists", "Reconcile", msg)
 	}
 
@@ -144,7 +149,7 @@ func (r *VirtualMachineReconciler) Reconcile(ctx context.Context, req ctrl.Reque
 }
 
 // createClaim writes the IPRequest owned by the VirtualMachine.
-func (r *VirtualMachineReconciler) createClaim(ctx context.Context, vm *unstructured.Unstructured, claimName, pool, nadName string) (ctrl.Result, error) {
+func (r *VirtualMachineReconciler) createClaim(ctx context.Context, vm *unstructured.Unstructured, claimName, pool, nadName string, allocation *ipamv1alpha1.AddressAllocation) (ctrl.Result, error) {
 	claim := &ipamv1alpha1.IPRequest{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: vm.GetNamespace(),
@@ -153,7 +158,7 @@ func (r *VirtualMachineReconciler) createClaim(ctx context.Context, vm *unstruct
 			// collection: VM -> IPRequest -> NAD, all by ownerReference, no finalizers.
 			OwnerReferences: []metav1.OwnerReference{controllerRef(vm, virtualMachineGVK)},
 		},
-		Spec: ipamv1alpha1.IPRequestSpec{PoolRef: pool, NAD: nadName},
+		Spec: ipamv1alpha1.IPRequestSpec{PoolRef: pool, NAD: nadName, Allocation: allocation},
 	}
 
 	switch err := r.Create(ctx, claim); {
@@ -174,6 +179,52 @@ func (r *VirtualMachineReconciler) createClaim(ctx context.Context, vm *unstruct
 	default:
 		return ctrl.Result{}, fmt.Errorf("creating IPRequest %s/%s: %w", vm.GetNamespace(), claimName, err)
 	}
+}
+
+// desiredAllocation translates the VM's annotations into the allocation the claim
+// should be created with.
+//
+// The address annotation is the only way to ask for a specific address on a VM.
+// It is Exact when present — a VM that names an address and silently gets a
+// different one is the failure the annotation exists to avoid — and Auto when
+// absent, written explicitly so the claim describes its own policy.
+func desiredAllocation(vm *unstructured.Unstructured) *ipamv1alpha1.AddressAllocation {
+	if addr := strings.TrimSpace(vm.GetAnnotations()[ipamv1alpha1.AnnotationAddress]); addr != "" {
+		return &ipamv1alpha1.AddressAllocation{
+			Strategy: ipamv1alpha1.AllocationExact,
+			Address:  addr,
+		}
+	}
+	return &ipamv1alpha1.AddressAllocation{Strategy: ipamv1alpha1.AllocationAuto}
+}
+
+// sameAllocation compares two allocations semantically.
+//
+// A claim created before the field existed has a nil allocation, which means Auto;
+// comparing with DeepEqual would call that different from an explicit Auto and
+// make the controller report an annotation change on every reconcile of an
+// untouched VM.
+func sameAllocation(a, b *ipamv1alpha1.AddressAllocation) bool {
+	if a.StrategyOf() != b.StrategyOf() {
+		return false
+	}
+	addrA, addrB := "", ""
+	if a != nil {
+		addrA = strings.TrimSpace(a.Address)
+	}
+	if b != nil {
+		addrB = strings.TrimSpace(b.Address)
+	}
+	return addrA == addrB
+}
+
+// describeAllocation renders a claim's inputs for the divergence event.
+func describeAllocation(pool, nad string, allocation *ipamv1alpha1.AddressAllocation) string {
+	desc := fmt.Sprintf("pool %q, nad %q and ", pool, nad)
+	if allocation.StrategyOf() == ipamv1alpha1.AllocationExact {
+		return desc + fmt.Sprintf("address %q", allocation.Address)
+	}
+	return desc + "an automatically chosen address"
 }
 
 // newVirtualMachine returns an empty VirtualMachine to decode into.

@@ -2,7 +2,10 @@
 
 Static, user-claimable IP addresses for KubeVirt VMs on a Multus + Whereabouts underlay.
 
-> **STATUS: IMPLEMENTED, NOT YET ROLLED OUT.**
+> **Just want to use it?** Read the [user guide](docs/user-guide.md) instead — it is task-shaped
+> and answers "what do I type". This README is the why: the design, the trade-offs, the risks.
+
+> **STATUS: DEPLOYED AND RUNNING; NOT YET A ROLLOUT.**
 >
 > Address allocation, claim lifecycle and per-VM NetworkAttachmentDefinition minting all work
 > and are covered by envtest. The mechanism the design gates on — a single-address NAD holding
@@ -10,9 +13,15 @@ Static, user-claimable IP addresses for KubeVirt VMs on a Multus + Whereabouts u
 > hardware** (2026-09-28, see [Spikes](#spikes-to-run-before-trusting-this)). So has live
 > migration, under the addressing mode that permits it.
 >
-> What has not happened is the rollout: the deployed pool still uses the older mode, and the
-> shared `vm-underlay-10-66-3-0` NAD has **not** been deleted. Doing so is a migration, not a
-> deploy — see [Retiring the shared underlay NAD](#retiring-the-shared-underlay-nad).
+> The controllers are deployed (`cubestack-system`, chart 0.3.0) and the live pool `dev-ip-pool` runs
+> `ipam: static`, so VMs claiming from it are migratable. Two items that were open in the previous
+> revision of this file have since closed. The re-rendered static NAD **has** now been exercised by a
+> real pod creation — measured 2026-09-28,
+> a VM created with no `networks[]` at all came up on the minted NAD and the CNI logged
+> `Add pod… [10.66.3.205/24] from default/vm-mapspike-static`. And the shared
+> `vm-underlay-10-66-3-0` NAD **has been deleted** (2026-09-29), once nothing referenced it — see
+> [Retiring the shared underlay NAD](#retiring-the-shared-underlay-nad), now a record of how it was
+> done rather than a plan.
 
 ## What this is
 
@@ -31,7 +40,15 @@ IPAM plugin and no dataplane change:
 - **`IPRequest`** — namespaced, created by a user or by the VirtualMachine controller, owned by
   the VM. The controller assigns it an address from the pool and — when the claim names a NAD —
   mints a **per-VM NetworkAttachmentDefinition** serving that one address. The VM attaches to
-  that NAD by a name it chose in advance, and **the guest stays on plain DHCP**.
+  that NAD by a name it chose in advance, and **the guest stays on plain DHCP**. The address is
+  normally the lowest free one; `spec.allocation` can demand a specific address instead — see
+  [Asking for a specific address](#asking-for-a-specific-address).
+- **`IPRangeRequest`** — namespaced, created by a user. Claims **N contiguous addresses** from an
+  existing pool and records them in `status.start`/`status.end`. No NAD is minted and no pool is
+  created — it is a reservation, for a consumer that needs a range rather than one address (a
+  nested platform being provisioned onto VMs and configuring its own IPAM, say). The run is
+  normally the lowest free one that fits; it can also be named exactly. See
+  [Reserving a block of addresses](#reserving-a-block-of-addresses).
 
 Every minted NAD serves exactly the one address its claim holds, and that is what makes the
 address survive a pod restart: the binding is a property of the network the VM attaches to,
@@ -60,12 +77,13 @@ collision becomes a silent duplicate rather than a loud failure.
 Full design: [`docs/kubevirt-vm-static-ip-design.md`](docs/kubevirt-vm-static-ip-design.md)
 (a copy of `design/vm/kubevirt-vm-static-ip-design.md`; the copy is the one bundled here).
 
-## The two CRDs
+## The three CRDs
 
 | CRD | Scope | Created by |
 |---|---|---|
 | `ippools.ipam.cubestack.io` | Cluster | admin |
 | `iprequests.ipam.cubestack.io` | Namespaced | user, or the VirtualMachine controller |
+| `iprangerequests.ipam.cubestack.io` | Namespaced | user (short name `iprr`) |
 
 `IPPool` divides along one line:
 
@@ -104,8 +122,10 @@ spec:
 | `range.start <= range.end` | controller | `Available=False/ReasonRangeInvalid` |
 | `gateway` outside `range` | controller | `Available=False/ReasonRangeInvalid` |
 | `gateway` inside `subnet` | controller | `Available=False/ReasonRangeInvalid` |
+| each `allocation.exclude` band inside `range` | controller | `Available=False/ReasonRangeInvalid` |
+| each `allocation.exclude` band ordered | controller | `Available=False/ReasonRangeInvalid` |
 
-The last three are the controller's because Kubernetes CEL has no ordering overload on IP values, so they cannot be written as schema rules however they are phrased. A pool that fails them is **accepted by the API server** — the condition is the only place you see it. They are enforced in Go, in `ipam.ValidatePoolRange`.
+The last five are the controller's because Kubernetes CEL has no ordering overload on IP values, so they cannot be written as schema rules however they are phrased. A pool that fails them is **accepted by the API server** — the condition is the only place you see it. They are enforced in Go, in `ipam.ValidatePoolRange`.
 
 The `gateway` row is worth knowing about: a gateway in a different subnet from `subnet` is trivially outside `range`, so the band check alone would wave it through, and the result is a VM whose default route points at an address its bridge cannot reach — the guest keeps its address, CNI `ADD` succeeds, and every off-link flow black-holes.
 
@@ -120,7 +140,11 @@ make helm-install IMG=<repo>/<img>:<tag>
 
 There is **no published image**, so the chart defaults to `controller:latest` — what `make docker-build` produces — and expects you to have loaded or pushed it. See `charts/cubestack-ipam/README.md` for the values, the tenant-RBAC caveat, and the migration note if you are replacing a kustomize install.
 
-One caveat is worth repeating here because it will bite this project specifically: Helm installs `crds/` on `helm install` and then **never upgrades or deletes them**. The `IPPool` schema is still moving, so after `make manifests` you need `make helm-sync-crds` *and* `kubectl apply -f charts/cubestack-ipam/crds/` — a `helm upgrade` alone will silently leave the old schema in place.
+One caveat is worth repeating here because it will bite this project specifically: Helm installs `crds/` on `helm install` and then **never upgrades or deletes them**. The schemas are still moving, so after `make manifests` you need `make helm-sync-crds` *and* `kubectl apply -f charts/cubestack-ipam/crds/` — a `helm upgrade` alone will silently leave the old schema in place.
+
+That is not advisory on the upgrade to **0.4.0**, which adds the `IPRangeRequest` kind. Skip the CRD apply and the kind does not exist at all — the manager watches it, so its cache cannot sync that informer, leadership is never acquired, and **nothing reconciles**: not blocks, not claims, not pools. The same release also makes `IPRequest.spec.poolRef` CEL-immutable, which only the new schema enforces. And unlike 0.3.0, 0.4.0 changes the **manager binary**, so the image has to be rebuilt and pushed rather than just the chart re-installed.
+
+**0.5.0 is a breaking API change, and the CRDs must go on first.** `IPRangeRequest.spec.count` moved to `spec.allocation.count` and `spec.allocation` is now required. A **bound** block survives: the allocator never re-derives a held block, so it is kept and continues to reconcile. An **unbound** one reports `AllocationInvalid` (there is no allocation to read), and the new schema will not let it be edited — the old top-level `count` is pruned on write and `allocation` is required — so the only conversion is to delete it and create it again. Everything else is additive: `IPRequest.spec.allocation` absent still means `Auto`, and `IPPool.spec.allocation` absent still means no exclusions with exact requests allowed. The image changes too, as always for a controller change.
 
 ## Using it
 
@@ -133,6 +157,11 @@ Or claim an address without a VM, with `config/samples/ipam_v1alpha1_iprequest.y
 **Apply one or the other, not both**: they claim the same NAD name, and the second would fail
 as `NADNameTaken`.
 
+`config/samples/ipam_v1alpha1_iprangerequest.yaml` reserves a block instead — see below. It is
+**not** in the samples kustomization, deliberately: every sample there shares `dev-ip-pool`, and a
+block takes the lowest free addresses in it, which are the ones the single-address sample and the
+VM sample expect to land on. Apply it *instead of* those, not alongside.
+
 `config/samples/ipam_v1alpha1_ippool_minimal.yaml` is the same pool without a `nadTemplate` — the ledger-only form above. Use it *instead of* the full pool, not alongside: both carry the same band, and each allocates against its own `PoolRef`, so two pools over one band would happily hand the same address to two claims.
 
 On the `VirtualMachine`:
@@ -141,6 +170,7 @@ On the `VirtualMachine`:
 |---|---|---|
 | `ipam.cubestack.io/pool` | yes | The cluster-scoped `IPPool` to claim from. Its presence is the trigger — without it the VM is left alone entirely |
 | `ipam.cubestack.io/nad-name` | no | The NAD to mint. Defaults to `<vm-name>-static` |
+| `ipam.cubestack.io/address` | no | A specific address to claim. The claim becomes `Exact`: it binds that address or fails, naming what is in the way |
 
 and the VM's network list names the same NAD:
 
@@ -157,37 +187,202 @@ spec:
 The name is derived from the VM's own name, never from the address — that is what lets the VM
 manifest be written before any address exists.
 
+## Asking for a specific address
+
+By default the allocator chooses: an `IPRequest` takes the lowest free address, an
+`IPRangeRequest` the lowest free run of its count. `spec.allocation` makes that choice the
+caller's instead.
+
+```yaml
+# one address, named
+spec:
+  poolRef: dev-ip-pool
+  allocation:
+    strategy: Exact
+    address: 10.66.3.205
+
+# a run, named
+spec:
+  poolRef: dev-ip-pool
+  allocation:
+    strategy: Exact
+    range:
+      start: 10.66.3.208
+      end: 10.66.3.215
+```
+
+Omitting `allocation` (or writing `strategy: Auto`) is exactly the old behaviour, and an
+`IPRequest` with no `allocation` at all is still valid — existing objects do not change meaning.
+The other shape — `Auto` with `count` for a block, `Auto` with no `count` for an address — is what
+you get if you do not write the block.
+
+**Exact is a demand, not a hint.** If the address is not available, the request fails; it is never
+given a different one. Each refusal is a distinct reason, and `status.blockers` names the objects
+in the way, so a conflict can be resolved without guessing:
+
+| Reason | Means | Blockers name |
+|---|---|---|
+| `AddressOutOfRange` / `RangeOutOfRange` | outside `spec.range` | nothing — it is the pool's band that rules it out |
+| `AddressExcluded` / `RangeExcluded` | inside an `allocation.exclude` band on the pool | the `IPPool`, and the band |
+| `AddressUnavailable` / `RangeUnavailable` | already held, by a claim or by a block | each holder, with its address or range |
+| `ExactNotAllowed` | the pool sets `allocation.allowExact: false` | the `IPPool` |
+| `AllocationInvalid` | the spec and the held status disagree | nothing — a hand edit, not a shortage |
+
+An `Auto` allocation never consults these: exhaustion is `Exhausted` (or `RangeExhausted` /
+`RangeFragmented`), which means "the pool is full", not "somebody has your address".
+
+**Exclusions** are how an address is kept out of the allocator's hands altogether — for another
+system's fixed address, say — rather than by hoping no claim lands on it:
+
+```yaml
+spec:
+  range:
+    start: 10.66.3.200
+    end: 10.66.3.230
+  allocation:
+    allowExact: true          # default; false refuses Exact requests on this pool
+    exclude:
+      - start: 10.66.3.200    # must lie inside range
+        end: 10.66.3.200
+```
+
+`Auto` skips excluded addresses, and `Exact` refuses them with the reason above, so an exclusion
+removes an address from the pool under either strategy. It is enforced by this allocator, not by
+the CNI: on a `static` pool that is the only enforcement there is.
+
+**Exact does not mean pre-reserved.** The address is arbitrated at the moment the claim binds,
+through the same ledger an `Auto` claim uses, so two `Exact` requests for one address cannot both
+bind — the second fails `AddressUnavailable` and says who holds it. The allocation race documented
+[above](#the-audit-sweep) applies here too, and is easier to hit because both callers named the
+same address: for an instant neither claim's status shows the other's assignment. The sweep's
+`DuplicateAddress` finding is still the detector for the residue, with the same mode-dependent
+consequences.
+
+**Nothing is moved once it binds.** A held address stays held even if the pool later narrows under
+it or an exclusion is added over it; the claim reports the disagreement instead. That is the same
+rule as everywhere else on this API: allocation never moves an address out from under a running
+VM. Delete the claim to reclaim it.
+
+**`allocation` is immutable** — the whole block, for both kinds — because the address is written
+into the NAD (or into `status` for a block) and changing it would move an address under a running
+VM. A different address or band is a different request. That is enforced by CEL, so it is an
+admission error rather than a condition.
+
+From a `VirtualMachine`, the annotation is the whole API: `ipam.cubestack.io/address` sets
+`strategy: Exact` and that address on the claim the controller creates. With no annotation the
+claim is `Auto`. The controller still makes no decision about availability and never retries with
+another address — the claim's own status is where a conflict shows, and the VM waits in
+`FailedCreatePodSandBox` until it clears.
+
+## Reserving a block of addresses
+
+Some consumers need a **range**, not one address — a nested platform being provisioned onto VMs
+that configures its own IPAM itself, for instance. An `IPRangeRequest` asks for a count of
+contiguous addresses from an existing pool:
+
+```yaml
+apiVersion: ipam.cubestack.io/v1alpha1
+kind: IPRangeRequest
+metadata:
+  name: blk-cubestack
+  namespace: default
+spec:
+  poolRef: dev-ip-pool          # cluster-scoped, so a bare name
+  allocation:
+    strategy: Auto
+    count: 8                    # poolRef and allocation are immutable
+```
+
+```bash
+kubectl apply -f config/samples/ipam_v1alpha1_iprangerequest.yaml
+kubectl get iprr -n default
+```
+
+```
+NAME           POOL          COUNT   START         END           PHASE   AGE
+blk-cubestack  dev-ip-pool   8       10.66.3.200   10.66.3.207   Bound   12s
+```
+
+`Bound` with a start and end is the whole result. **The pool remains the single allocator**: the
+block is drawn through the same ledger a VM's claim uses, so it cannot overlap a VM's address or
+another block — by construction, rather than by two admins picking disjoint bands and hoping. Under
+`strategy: Auto` the allocator takes the **lowest free run** that fits, unaligned; a free address
+that cannot be part of a long-enough run is skipped rather than handed out, and if no such run
+exists the request fails with `RangeFragmented` naming the longest run available, which is a
+different fix from `RangeExhausted`. Under `strategy: Exact` the run is the one named in
+`allocation.range` or nothing — see
+[Asking for a specific address](#asking-for-a-specific-address).
+
+Two things it deliberately is not:
+
+- **Not an `IPPool`.** Nothing here creates one. If you want the block to be independently
+  allocatable, an admin still declares a pool for it; this kind only reserves addresses out of a
+  band that already exists.
+- **Not self-consuming.** Nothing reconfigures whatever you hand these addresses to. There is no
+  NAD minted and no guest touched.
+
+> **Deleting one frees the addresses immediately.** No finalizer holds them and nothing downstream
+> is un-configured, so a component still using them keeps using them while the allocator hands
+> them to the next VM — and on a `static` pool nothing refuses the duplicate. Delete a range
+> request only once its consumer has stopped. The delete emits a `RangeReleased` warning naming the
+> pool and the released range, and the [audit sweep](#the-audit-sweep) reports a later holder
+> landing inside a block, but neither is a guard. This is the one operation on this API that can
+> cause an outage.
+
+`poolRef` and the whole `allocation` block are **immutable**. Changing either would move addresses
+out from under whatever was configured with them, so a different block is a different request:
+delete it and create a new one.
+
 ## Lifecycle
 
 1. Admin creates an `IPPool`: the band, and — if the pool should mint networks — the NAD template carrying its subnet, gateway, bridge and an `ipam` mode.
 2. User creates a VM carrying `ipam.cubestack.io/pool` and naming its NAD.
 3. Controller #2 creates `IPRequest` `<vm-name>-ip` in the VM's namespace, owned by the VM.
-4. Controller #1 takes the **lowest free address** in the pool, then mints the NAD from the pool's
-   template — carrying that one address, in the mode the template selected — owned by the claim.
+4. Controller #1 takes the **lowest free address** in the pool — or, if the claim named one, that
+   address and nothing else — then mints the NAD from the pool's template, carrying that one
+   address in the mode the template selected, owned by the claim.
 5. The guest stays on DHCP. No guest-side static configuration.
 6. Deleting the VM garbage-collects the claim, which garbage-collects the NAD.
 
 **Ordering:** the VM necessarily exists before its NAD, so it shows `FailedCreatePodSandBox` for
 the few seconds until step 4. That is a visible, self-healing wait, not a failure to investigate.
 
-**No finalizers anywhere.** The chain is `VM → IPRequest → NAD`, all by `ownerReference`, and
-release is garbage collection walking it. A claim keeps the address it already holds — it is never
-re-derived — so a claim cannot move because another one appeared beneath it.
+A range request is the same path with the NAD half removed:
 
-**Two controllers, split by what they decide:**
+1. User creates an `IPRangeRequest` naming a pool and, in `allocation`, either a count or an exact band.
+2. Controller #3 takes the **lowest free run of that count** — or the named band, if it can have it
+   — and records it in `status.start`/`status.end`.
+3. Deleting the object is the release. Nothing is garbage-collected, because nothing was created.
+
+**No finalizers anywhere.** The chain for a VM is `VM → IPRequest → NAD`, all by `ownerReference`,
+and release is garbage collection walking it. A range request is a leaf: it owns nothing, so
+deleting it *is* the release. A claim keeps the address it already holds — it is never re-derived —
+so a claim cannot move because another one appeared beneath it, and a bound block is never moved
+either (a block whose pool narrows under it is kept and reported `RangeInvalid` rather than
+silently relocated).
+
+**Three controllers, split by what they decide:**
 
 | | Owns | Does |
 |---|---|---|
 | #1 | `IPPool`, `IPRequest` | Validates pools, allocates addresses, mints NADs |
 | #2 | `VirtualMachine` | Turns the annotation into a claim, and nothing else |
+| #3 | `IPRangeRequest` | Allocates contiguous blocks, and nothing else |
 
 The split is deliberate: whichever mode a pool uses, the NAD's addressing *is* the assigned
 address, so both have to be written by one controller or the two can disagree.
 
+**#1 and #3 share one ledger reader** (`internal/controller/ledger.go`), which lists both request
+kinds and expands a block's `status.start`/`status.end` into the addresses it holds. That is what
+makes a claim unable to land inside a delegated block, and a block unable to swallow an address a
+claim already holds. Two independent readers would have made that a convention rather than a
+property. Each also watches the other's kind, so deleting whichever one was holding a pool at
+capacity re-triggers the other.
+
 **Controller #2 is create-only.** It never patches the VM, and never patches a claim that already
-exists. So **editing `ipam.cubestack.io/pool` on a VM that already has a claim does nothing** apart
-from an event saying so. To move a VM to another pool or NAD name, delete the `IPRequest` and let
-it be recreated:
+exists. So **editing `ipam.cubestack.io/pool` or `ipam.cubestack.io/address` on a VM that already
+has a claim does nothing** apart from an event saying so. To move a VM to another pool, NAD name or
+address, delete the `IPRequest` and let it be recreated:
 
 ```bash
 kubectl -n default delete iprequest <vm-name>-ip
@@ -199,7 +394,7 @@ object this project did not create is never adopted or overwritten.
 
 ## The audit sweep
 
-Every 10 minutes a sweep outside both controllers looks for what no single reconcile can see from
+Every 10 minutes a sweep outside the controllers looks for what no single reconcile can see from
 the object it is working on, and reports each finding as a `Warning` event (and a log line). It
 writes no status, so it cannot race the controllers it is checking.
 
@@ -207,7 +402,24 @@ writes no status, so it cannot race the controllers it is checking.
 |---|---|
 | `OrphanedNAD` | A NAD of ours whose claim is gone. Its address is held by no claim, so the allocator can hand it to a new one while the orphan's VM may still be running |
 | `DuplicateAddress` | Two claims holding one address. Names both, because neither claim's own status shows anything wrong |
+| `AddressInBlock` | A claim's address falls inside a delegated block. Names both, same reason — neither object's own status shows anything wrong |
+| `RangeOverlap` | Two blocks in one pool intersect. The block-vs-block residue of the same allocation race |
 | `PoolDeleted` | Claims left behind by a deleted pool, reported once with a count |
+
+`AddressInBlock` and `RangeOverlap` are what the block API adds to this sweep, and they exist for
+the same reason `DuplicateAddress` does: a block is held by one object instead of one object per
+address, so without them a collision would be *quieter* than before, not louder.
+
+Their wording is deliberately not the same as `DuplicateAddress`'s, because a block is not CNI
+state. On a `whereabouts` pool a duplicate claim is refused at `ADD`, but Whereabouts does not know
+the block exists — nothing refuses the CNI — so the finding says so rather than promising a
+failure that will not happen. On a `static` pool the consequence is the same intermittent
+connectivity a duplicate produces.
+
+**What the sweep cannot see:** a block deleted while a component outside the cluster still uses
+it. The object is gone and nothing recorded its former contents, so there is no evidence left to
+find. That case is only ever visible as its consequence — which is these findings catching a *new*
+holder colliding with a stale user.
 
 `DuplicateAddress` is the residue of a race that is documented rather than closed: two claims
 created in the same instant can both be reconciled against a cache that does not yet show the
@@ -231,6 +443,13 @@ hygiene.**
 
 - **No IPPool deletion guard.** Deleting a pool leaves existing claims working; the audit reports
   the dangling references afterwards.
+- **No deletion guard on a delegated block.** Deleting an `IPRangeRequest` releases its addresses
+  at once, and nothing holds it while whatever was configured with them stops. A finalizer would be
+  this project's first, and it would make release a two-step operation for a consumer this cluster
+  cannot see or verify — so the trade was made the other way: a delete-time `RangeReleased` warning,
+  the `AddressInBlock` finding above, and
+  [a loud section in the README](#reserving-a-block-of-addresses). **This is the one operation on
+  this API that can cause an outage.**
 - **No cluster-wide NAD overlap sweep.** A pool's band must be disjoint from any other NAD on the
   same subnet, but with the shared NAD retired there is no longer a live object to audit against.
   This is an admin responsibility, bounded by RBAC: **regular users cannot create NADs**, so an
@@ -239,6 +458,14 @@ hygiene.**
 - **MetalLB is not installed** on this cluster (no CRDs, no namespace, verified 2026-09-28), so the
   MetalLB half of design R5 is unenforceable and moot. If it is ever installed on this subnet, the
   band has to be re-checked against it.
+- **No reservation ahead of binding.** `strategy: Exact` names the address a claim must get, but it
+  does not set it aside: until the claim binds, the address is free for an `Auto` claim to take,
+  and the `Exact` one then fails `AddressUnavailable`. Nothing in this API holds an address for a
+  caller that has not asked for it yet. An exclusion on the pool is the tool for keeping an
+  address out of every claim.
+- **No enforcement of an exclusion over a holder.** Excluding a band, like narrowing `range`,
+  does not move an address that is already bound; the holder keeps it and the pool validates
+  against the new exclusion for everyone else. That is the sticky-allocation rule, not a gap.
 - **No automatic choice of `ipam` mode.** It is per pool, made at creation, and not revisited.
 
 ## Live migration
@@ -270,15 +497,33 @@ you get no error and no eviction strategy. Confirm it landed with `kubectl get v
 
 ## Retiring the shared underlay NAD
 
-`vm-underlay-10-66-3-0` is **still live**. This project does not delete it, and deleting it is not
-a deployment step — it cuts the network off from every VM and pod still attaching it (design O7).
-The order has to be:
+**Done — `vm-underlay-10-66-3-0` was deleted on 2026-09-29.** This section is kept as the record of
+*how*, because the order is the part that would be got wrong on a second cluster.
 
-1. Deploy cubestack-ipam and create the `IPPool`.
-2. Move consumers onto claims, one at a time, verifying each VM's address.
-3. Only once nothing references the shared NAD, delete it.
+The NAD could not simply be deleted: doing so cuts the network off from every VM and pod still
+attaching it (design O7). The order was:
 
-Step 2 and 3 are out of scope here.
+1. Deploy cubestack-ipam and create the `IPPool`. ✅
+2. Move consumers onto claims, one at a time, verifying each VM's address. ✅ — all five VMs
+   (`clq-cubestack-node-0`, `vm-roce-gpu`, `vm1/2/3-weina`) ended up on their own minted NADs.
+3. Only once nothing references the shared NAD, delete it. ✅
+
+Step 3 was a sweep, not an assumption: no `VirtualMachine`, `VirtualMachineInstance`,
+`VirtualMachinePool`, `Pod` (including terminated ones), `ConfigMap` or CNAO config referenced it,
+both Whereabouts ledgers were empty, and the NAD had no finalizers or owner references. The only
+hit was the stale `last-applied-configuration` annotation on `VirtualMachinePool/clq-cubestack-node`
+— kubectl bookkeeping, not a live reference.
+
+Deletion was a no-op for every workload: five VMs stayed `Running`, five claims stayed `Bound` on
+the same addresses. It also closed the band-overlap hazard, because that NAD was the **only**
+Whereabouts NAD left on `10.66.3.0/24` — `dev-ip-pool` is now the sole allocator on the subnet, so
+there is nothing left for a `static` band to collide with.
+
+**Second-order effect, worth knowing before editing a pool.** Removing `networks[]`/`interfaces[]`
+from a `VirtualMachinePool`'s template so the injection policy supplies them **restarts every
+member** — measured 2026-09-28: the pool controller rewrote the member and KubeVirt gracefully shut
+its VMI down one second later. The address survives (the minted NAD pins it), but plan for the
+restart rather than expecting a mere `RestartRequired` condition.
 
 ## Verified environment
 
@@ -321,8 +566,9 @@ cannot see them: it will happily hand a dynamic pod an address a static claim is
 and the first symptom is a broken flow rather than a failed `ADD`. Splitting the bands is what
 keeps that from happening — see [The audit sweep](#the-audit-sweep).
 
-The `10.66.3.0/24` NAD that established this (and carries the config the sample's `nadTemplate`
-was copied from):
+The `10.66.3.0/24` NAD that established this — and the config the sample's `nadTemplate` was copied
+from. **It no longer exists** (deleted 2026-09-29); the config is kept here because it is the
+provenance of the template, not because anything reads it:
 
 ```json
 {
@@ -340,32 +586,44 @@ was copied from):
 }
 ```
 
-A NAD on this underlay also needs the annotation
-`k8s.v1.cni.cncf.io/resourceName: bridge.network.kubevirt.io/br0`. Minted NADs do **not** carry it
-— if a VM on one fails to start with a resource error, that is the first thing to check.
+**A minted NAD needs no annotations at all.** An earlier version of this file claimed every underlay
+NAD must carry `k8s.v1.cni.cncf.io/resourceName: bridge.network.kubevirt.io/br0`, and that minted NADs
+were broken without it. **That is false** — the hand-written NAD carried the annotation, so it was
+mistaken for a requirement. Measured 2026-09-28: VMs started normally on minted NADs with no
+annotations. If a VM on one fails to start, look at the claim's condition, not at the NAD's metadata.
 
-## Address facts the source documents disagree about
+## Address facts — settled, and the one disagreement that outlived the NADs
 
-Do **not** bake defaults from any single document. Each of these was confirmed by comparing
-the design against the guides; pin them against the live cluster first:
+**This section used to be a list of contradictions between the design and the guides, resolved by
+reading the shared NADs off the cluster. Both of those NADs are now deleted**, so there is nothing
+left to read, and the contradictions it recorded are moot: the band is no longer inherited from a
+hand-written NAD at all, it is whatever the pool declares. Take the facts from the pool:
 
 ```bash
-export KUBECONFIG=~/.kube/kubeconfig.vm
-kubectl get nad -n default vm-underlay-10-66-2-0 vm-underlay-10-66-3-0 -o jsonpath='{.spec.config}'
+export KUBECONFIG=/Users/elgnay/workspaces/suanova/design/vm/kubeconfig
+kubectl get ippools.ipam.cubestack.io dev-ip-pool -o jsonpath='{.spec}{"\n"}'
+kubectl get nad -n default dev-ip-pool -o jsonpath='{.spec.config}{"\n"}'   # a member's NAD, if any exist
 ```
 
-| Fact | Conflicting sources |
+For the record, the two facts that every document already agreed on, and which the pool keeps:
+gateway `10.66.3.254`, DNS `223.5.5.5` / `8.8.8.8`. The `10.66.2.0/24` window is not a fact about
+anything — that subnet has no nodes and no NAD.
+
+**The one disagreement still worth knowing about** is not about an address:
+
+| Fact | Position |
 |---|---|
-| `10.66.2.0/24` dynamic window | `10.66.2.130–.139` (user guide §1.3, cluster-admin guide §2.1) **vs** `.200–.220` (design §R5, RDMA proposal) |
-| `10.66.3.0/24` static band | `.150–.189` (design §5.4, and the sample here) **vs** `.181–.199` (user guide §7C) |
-| Whether the Multus `ips` annotation works | underlay guide §7C titles it 推荐 and claims Whereabouts enforces it **vs** user guide §7 which opens by calling the same annotation 反模式 |
+| Whether the Multus `ips` annotation works | the underlay guide §7C titles it 推荐 and claims Whereabouts enforces it **vs** the user guide §7 which calls the same annotation 反模式 |
 
-The `10.66.3.0/24` dynamic window (`.200–.220`), gateway (`10.66.3.254`) and DNS are
-consistent across every document. The `.2` window and the `.3` static band are not.
+It is unresolved here, and it does not need resolving: **do not use it.** The pool path is what
+`ips` was reaching for — an address that is stable and exclusive — and it does so without pinning the
+guest to a hand-written address. See §"Never assign an underlay IP yourself" in the user guide.
 
-Whatever band is chosen must be disjoint from any other NAD serving the same subnet — and from
-the **MetalLB pool** if one is ever installed (the design mentions `.221–.240`; it is not
-installed today).
+Any band a pool declares must be disjoint from every other allocator on the same subnet — other pools,
+any remaining Whereabouts NAD, and the **MetalLB pool** if one is ever installed (the design mentions
+`.221–.240`; it is not installed today). With the shared NAD deleted there is currently no dynamic
+window on `10.66.3.0/24` to avoid, which makes this easier than it was — but it is a property of the
+present, not a guarantee.
 
 ## Spikes to run before trusting this
 

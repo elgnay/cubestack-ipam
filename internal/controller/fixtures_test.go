@@ -17,6 +17,8 @@ limitations under the License.
 package controller
 
 import (
+	"sort"
+
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -37,6 +39,18 @@ const (
 	testFirstIP  = "10.66.3.150"
 	testSecondIP = "10.66.3.151"
 	testThirdIP  = "10.66.3.152"
+)
+
+// The band the block specs run on: an eight-address extension of the three above.
+// Three addresses are exactly right for observing lowest-first allocation and
+// exhaustion on single addresses, but a block needs room to be one — two requests
+// and a claim have to fit, and a fragmentation case needs free addresses that do
+// not line up.
+const (
+	testFourthIP     = "10.66.3.153"
+	testFifthIP      = "10.66.3.154"
+	testSixthIP      = "10.66.3.155"
+	testBlockBandEnd = "10.66.3.157"
 )
 
 // testPoolSpec is a pool with a template, i.e. one that can mint NADs.
@@ -76,6 +90,14 @@ func testLedgerOnlySpec() ipamv1alpha1.IPPoolSpec {
 	}
 }
 
+// testBlockPoolSpec is testPoolSpec over the eight-address band the block specs
+// need, from testFirstIP through testBlockBandEnd.
+func testBlockPoolSpec() ipamv1alpha1.IPPoolSpec {
+	spec := testPoolSpec()
+	spec.Range = ipamv1alpha1.IPRange{Start: testFirstIP, End: testBlockBandEnd}
+	return spec
+}
+
 // createPool creates a cluster-scoped pool and removes it when the spec ends.
 func createPool(name string, spec ipamv1alpha1.IPPoolSpec) {
 	pool := &ipamv1alpha1.IPPool{
@@ -91,9 +113,27 @@ func createPool(name string, spec ipamv1alpha1.IPPoolSpec) {
 // createClaim creates a claim in the given namespace and removes it when the spec
 // ends. It returns the object as created, so callers can reconcile it.
 func createClaim(namespace, name, pool, nad string) *ipamv1alpha1.IPRequest {
+	return createClaimWithAllocation(namespace, name, pool, nad, &ipamv1alpha1.AddressAllocation{
+		Strategy: ipamv1alpha1.AllocationAuto,
+	})
+}
+
+// createExactClaim creates a claim that asks for one named address.
+func createExactClaim(namespace, name, pool, address string) *ipamv1alpha1.IPRequest {
+	return createClaimWithAllocation(namespace, name, pool, "", &ipamv1alpha1.AddressAllocation{
+		Strategy: ipamv1alpha1.AllocationExact,
+		Address:  address,
+	})
+}
+
+// createClaimWithAllocation is the shared create, written explicitly rather than
+// left to an omitted allocation: these specs are about a strategy being named, and
+// a fixture that relied on the absent-field fallback would not notice the fallback
+// changing.
+func createClaimWithAllocation(namespace, name, pool, nad string, allocation *ipamv1alpha1.AddressAllocation) *ipamv1alpha1.IPRequest {
 	claim := &ipamv1alpha1.IPRequest{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
-		Spec:       ipamv1alpha1.IPRequestSpec{PoolRef: pool, NAD: nad},
+		Spec:       ipamv1alpha1.IPRequestSpec{PoolRef: pool, NAD: nad, Allocation: allocation},
 	}
 	ExpectWithOffset(1, k8sClient.Create(ctx, claim)).To(Succeed())
 	DeferCleanup(func() {
@@ -118,12 +158,96 @@ func getNAD(namespace, name string) *unstructured.Unstructured {
 	return nad
 }
 
+// listNADs returns the namespace/name of every NetworkAttachmentDefinition in the
+// cluster, sorted. For specs asserting that nothing was created — which have no
+// name to look up, and for which a negative lookup would pass on a typo.
+func listNADs() []string {
+	var nads unstructured.UnstructuredList
+	nads.SetGroupVersionKind(networkAttachmentDefinitionGVK.GroupVersion().WithKind("NetworkAttachmentDefinitionList"))
+	ExpectWithOffset(1, k8sClient.List(ctx, &nads)).To(Succeed())
+
+	names := make([]string, 0, len(nads.Items))
+	for i := range nads.Items {
+		names = append(names, nads.Items[i].GetNamespace()+"/"+nads.Items[i].GetName())
+	}
+	sort.Strings(names)
+	return names
+}
+
 // getClaim reads a claim, so assertions run against what the API server holds
 // rather than against the in-memory object the reconciler mutated.
 func getClaim(namespace, name string) *ipamv1alpha1.IPRequest {
 	claim := &ipamv1alpha1.IPRequest{}
 	ExpectWithOffset(1, k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, claim)).To(Succeed())
 	return claim
+}
+
+// bindClaim records an address in a claim's status directly, as the claim
+// reconciler would have.
+//
+// The audit specs need a collision to exist, and the allocator is precisely what
+// makes one impossible — so the fixture writes the state instead of driving the
+// thing under test to produce it.
+func bindClaim(namespace, name, pool, addr string) *ipamv1alpha1.IPRequest {
+	claim := createClaim(namespace, name, pool, "")
+	claim.Status.Phase = ipamv1alpha1.IPRequestPhaseBound
+	claim.Status.AssignedIP = addr
+	ExpectWithOffset(1, k8sClient.Status().Update(ctx, claim)).To(Succeed())
+	return claim
+}
+
+// createRangeRequest creates an Auto block request in the given namespace and
+// removes it when the spec ends.
+func createRangeRequest(namespace, name, pool string, count int32) *ipamv1alpha1.IPRangeRequest {
+	return createRangeRequestWithAllocation(namespace, name, pool, ipamv1alpha1.RangeAllocation{
+		Strategy: ipamv1alpha1.AllocationAuto,
+		Count:    &count,
+	})
+}
+
+// createExactRangeRequest creates a block request that asks for one named band.
+func createExactRangeRequest(namespace, name, pool, start, end string) *ipamv1alpha1.IPRangeRequest {
+	return createRangeRequestWithAllocation(namespace, name, pool, ipamv1alpha1.RangeAllocation{
+		Strategy: ipamv1alpha1.AllocationExact,
+		Range:    &ipamv1alpha1.IPRange{Start: start, End: end},
+	})
+}
+
+func createRangeRequestWithAllocation(namespace, name, pool string, allocation ipamv1alpha1.RangeAllocation) *ipamv1alpha1.IPRangeRequest {
+	block := &ipamv1alpha1.IPRangeRequest{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec:       ipamv1alpha1.IPRangeRequestSpec{PoolRef: pool, Allocation: allocation},
+	}
+	ExpectWithOffset(1, k8sClient.Create(ctx, block)).To(Succeed())
+	DeferCleanup(func() {
+		ExpectWithOffset(1, client.IgnoreNotFound(k8sClient.Delete(ctx, block))).To(Succeed())
+	})
+	return block
+}
+
+// getRangeRequest reads a range request, for the same reason getClaim does.
+func getRangeRequest(namespace, name string) *ipamv1alpha1.IPRangeRequest {
+	block := &ipamv1alpha1.IPRangeRequest{}
+	ExpectWithOffset(1, k8sClient.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, block)).To(Succeed())
+	return block
+}
+
+// bindRange records a block in a range request's status directly. Same reasoning
+// as bindClaim: the audit's subject is what the sweep makes of a state, not how
+// the state arose.
+func bindRange(namespace, name, start, end string) {
+	block := getRangeRequest(namespace, name)
+	block.Status.Phase = ipamv1alpha1.IPRangeRequestPhaseBound
+	block.Status.Start = start
+	block.Status.End = end
+	ExpectWithOffset(1, k8sClient.Status().Update(ctx, block)).To(Succeed())
+}
+
+// reconcileRange drives the block reconciler once, as the manager would.
+func reconcileRange(namespace, name string) {
+	r := &IPRangeRequestReconciler{Client: k8sClient, Scheme: k8sClient.Scheme()}
+	_, err := r.Reconcile(ctx, requestFor(namespace, name))
+	ExpectWithOffset(1, err).NotTo(HaveOccurred())
 }
 
 // requestFor builds the reconcile request for a namespaced object.

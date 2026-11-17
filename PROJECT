@@ -26,4 +26,13 @@ resources:
   kind: IPRequest
   path: github.com/suanova/cubestack-ipam/api/v1alpha1
   version: v1alpha1
+- api:
+    crdVersion: v1
+    namespaced: true
+  controller: true
+  domain: cubestack.io
+  group: ipam
+  kind: IPRangeRequest
+  path: github.com/suanova/cubestack-ipam/api/v1alpha1
+  version: v1alpha1
 version: "3"

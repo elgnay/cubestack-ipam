@@ -8,7 +8,7 @@ metadata:
   namespace: default
 spec:
   # IPPool is cluster-scoped, so this is a bare name with no namespace.
-  poolRef: cubestack-static-v4
+  poolRef: dev-ip-pool
 
   # Optional. The NAD to mint for this claim, in this namespace. The generated NAD
   # takes this name verbatim, which is what lets the VM manifest be written before
@@ -19,6 +19,24 @@ spec:
   # manifest has to name the NAD.
   nad: cubestack6-static
 
-  # There is deliberately no requestedIP. The controller takes the lowest free
-  # address in the pool, so allocation is deterministic and the address cannot be
-  # contradicted by a name the user guessed. Read status.assignedIP for the result.
+  # Optional. Omit the whole block for the default, which is exactly what strategy
+  # Auto below says: the controller takes the lowest free address, so allocation is
+  # deterministic and the address cannot be contradicted by a name the user guessed.
+  # Read status.assignedIP for the result.
+  allocation:
+    strategy: Auto
+
+  # To require a specific address instead, replace the block above with:
+  #
+  #   allocation:
+  #     strategy: Exact
+  #     address: 10.66.3.205
+  #
+  # That is not a hint. If .205 is outside dev-ip-pool's range, excluded by the
+  # pool, or already held, this claim fails with status.blockers naming the holder
+  # -- it is never given a different address. A pool can refuse exact requests
+  # altogether with spec.allocation.allowExact: false.
+  #
+  # allocation is immutable: the address is written into the NAD this claim owns,
+  # so changing it after binding would move an address under a running VM. Delete
+  # the claim and create a new one to ask for another address.

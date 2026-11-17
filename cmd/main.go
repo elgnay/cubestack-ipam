@@ -196,6 +196,14 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "iprequest")
 		os.Exit(1)
 	}
+	if err := (&controller.IPRangeRequestReconciler{
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorder("cubestack-ipam-range"),
+	}).SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "Failed to create controller", "controller", "iprangerequest")
+		os.Exit(1)
+	}
 	if err := (&controller.VirtualMachineReconciler{
 		Client:   mgr.GetClient(),
 		Scheme:   mgr.GetScheme(),

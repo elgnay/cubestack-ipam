@@ -14,11 +14,27 @@ metadata:
     # Controller #2 reads it and creates an IPRequest named <vm-name>-ip in this
     # namespace, owned by this VM. Controller #1 then allocates an address and
     # mints the NAD named below. Neither controller ever patches the VM.
-    ipam.cubestack.io/pool: cubestack-static-v4
+    #
+    # List the pools before choosing one: `kubectl get ippools.ipam.cubestack.io`
+    # (full resource name -- Whereabouts also owns a plural `ippools`).
+    ipam.cubestack.io/pool: dev-ip-pool
 
     # Optional. The NAD to mint; it defaults to <vm-name>-static, which is
     # "cubestack6-static" here. Set it only when you want a different name.
     ipam.cubestack.io/nad-name: cubestack6-static
+
+    # Optional. Ask for a specific address instead of the lowest free one:
+    #
+    #   ipam.cubestack.io/address: 10.66.3.205
+    #
+    # The claim then uses strategy Exact. It is not a hint -- if the address is
+    # outside the pool, excluded by it, or already held, the claim fails and
+    # describes which. The VM still starts only once the claim has bound, so a
+    # wrong address shows up as a VM waiting rather than as one on the wrong IP.
+    #
+    # Create-only, like every annotation here: adding or changing this on a VM
+    # that already has a claim does not move the address. Delete the claim
+    # (<vm-name>-ip) to re-claim.
 spec:
   runStrategy: Always
   dataVolumeTemplates:
@@ -68,8 +84,9 @@ spec:
       # spec.evictionStrategy. KubeVirt's CRD is structural, so a wrong field name is
       # silently pruned by the apiserver rather than rejected, and you get no warning
       # at all -- check with `kubectl get vm -o jsonpath` that it actually landed.
-      nodeSelector:
-        kubevirt.io/subnet: 10-66-3-0
+      # No nodeSelector. Every node is on the same subnet, so the address is
+      # decided by the pool-minted NAD alone; a subnet node label would exclude
+      # nothing. All three nodes are valid migration targets for the same reason.
       domain:
         cpu:
           cores: 4

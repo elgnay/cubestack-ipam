@@ -34,9 +34,10 @@ import (
 //
 // Its whole job is to answer one question: is this pool usable as written? The
 // answer goes in status.conditions and nowhere else. In particular there is no
-// ledger of allocated addresses here — the set of IPRequests is the only
-// authoritative record of who holds what, and a second list would be a second
-// thing to keep in step.
+// ledger of allocated addresses here — the set of IPRequests and the set of
+// IPRangeRequests together are the only authoritative record of who holds what,
+// and a second list would be a second thing to keep in step. See
+// internal/controller/ledger.go for the one reader both allocators use.
 //
 // The pool's other declared invariant — that its band is disjoint from any other
 // NAD serving the same subnet — is deliberately NOT checked. With the shared

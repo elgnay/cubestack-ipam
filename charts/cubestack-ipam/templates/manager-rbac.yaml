@@ -16,6 +16,14 @@
     - network-attachment-definitions has create/get/list/update/watch but no delete,
       and virtualmachines is read-only. The controller is create-only with respect to
       VirtualMachines and never adopts a NAD it did not create.
+
+  And one thing that is easy to "fix" in the wrong direction: the events rule is in the
+  `events.k8s.io` group, NOT the core `""` group. controller-runtime's GetEventRecorder
+  writes the newer events API, so a core-group rule grants nothing at all -- every event
+  is rejected at runtime with "cannot create resource events in API group
+  events.k8s.io" while the reconcile itself succeeds and looks perfectly healthy. That
+  is how this shipped broken once. Do not "correct" it back to "". See
+  internal/controller/events.go.
 */}}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -25,7 +33,7 @@ metadata:
     {{- include "cubestack-ipam.labels" . | nindent 4 }}
 rules:
 - apiGroups:
-  - ""
+  - events.k8s.io
   resources:
   - events
   verbs:
@@ -35,6 +43,7 @@ rules:
   - ipam.cubestack.io
   resources:
   - ippools
+  - iprangerequests
   verbs:
   - get
   - list
@@ -43,6 +52,7 @@ rules:
   - ipam.cubestack.io
   resources:
   - ippools/status
+  - iprangerequests/status
   - iprequests/status
   verbs:
   - get

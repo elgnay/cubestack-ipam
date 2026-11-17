@@ -1,13 +1,14 @@
 <!--
   Bundled copy of design/vm/kubevirt-vm-static-ip-design.md from the suanova/design
-  repository, current as of 2026-09-28. Edit the canonical copy there; this one is a
+  repository, current as of 2026-09-29. Edit the canonical copy there; this one is a
   snapshot kept here so the repo is self-contained.
 
   The API group used in §5.4 and §5.6 (ipam.cubestack.io) matches the implementation, and
   §5, §7, §8 and §9 record where the implementation landed: §5.3 now describes the two
   addressing modes (nadTemplate.ipam: whereabouts | static), R1 is closed by that split
   rather than by declaring migration out of scope, both spike 1 and spike 2 have run, and
-  the shared underlay NAD is being retired. The rollout has not happened -- see the README.
+  the shared underlay NAD has been retired (§R7). The rollout has not happened -- see the
+  README.
 -->
 # Static IP assignment for KubeVirt VMs — design proposal
 
@@ -17,9 +18,12 @@ spike records. **Spike 1 has run and passes**, and spike 2 has been replaced by 
 the two properties that risk analysis treated as one requirement — a duplicate being loud, and a
 VM being migratable — turned out to be mutually exclusive, so the addressing mode is now a
 per-pool choice (§5.3). §10 says which claims were checked against a live cluster and which were
-not.
-**Date:** 2026-09-23 (status line updated 2026-09-28)
-**Scope:** user-side VM addressing on the `10.66.2.0/24` and `10.66.3.0/24` underlays.
+not. **The cutover R7 warns about has since been carried out** — the shared `vm-underlay-10-66-3-0`
+NAD was deleted on 2026-09-29 — so §2's NAD config and Appendix A's first two commands are now
+historical.
+**Date:** 2026-09-23 (status line updated 2026-09-29)
+**Scope:** user-side VM addressing on the `10.66.3.0/24` underlay. (The `10.66.2.0/24` underlay named
+in earlier revisions no longer exists — no node carries that subnet and its NAD is gone.)
 **Related:** `kubevirt-vm-user-guide.md` §6.3/§7, `kubevirt-underlay-network-guide.md` §7C, `kubevirt-cluster-admin-guide.md` §2.
 
 ---
@@ -100,8 +104,10 @@ Read from the live cluster through `KUBECONFIG=~/.kube/kubeconfig.vm`.
 | MAC allocation | kubemacpool, in `cluster-network-addons`, MAC persisted into the VM spec |
 | Whereabouts CRDs | `ippools`, `overlappingrangeipreservations` only |
 
-The `10.66.3.0/24` NAD carries the effective IPAM config — the `IPPool` CR is only the
-allocation ledger:
+The `10.66.3.0/24` NAD carried the effective IPAM config — the `IPPool` CR was only the
+allocation ledger. **That NAD has since been deleted** (2026-09-29), as part of the cutover this
+design calls for; the config is quoted here because it is what §5.4's `nadTemplate` was derived
+from, not because it is still live:
 
 ```json
 {
@@ -119,7 +125,7 @@ allocation ledger:
 }
 ```
 
-Observed allocations cluster in `.200–.207`, consistent with `range_start` being honoured.
+Observed allocations clustered in `.200–.207`, consistent with `range_start` being honoured.
 
 ---
 
@@ -196,6 +202,9 @@ release is garbage collection walking that chain.
    checking, DNS, routes).
 2. User creates a VM carrying `ipam.cubestack.io/pool: cubestack-static-v4` and naming its NAD in
    `multus.networkName` — a name it can choose before any address exists.
+   *(Pool names throughout this document are the design's originals. `cubestack-static-v4` did exist
+   live — the sample in `config/samples/` was applied — and it has since been replaced by
+   `dev-ip-pool`. Read the names as illustrative; the live pool is whatever the admin declares.)*
 3. Controller #2 creates `IPRequest` `<vm-name>-ip` in the VM's namespace, with `spec.nad` set and
    an `ownerReference` to the VM.
 4. Controller #1 takes the lowest free address in the pool, writes `status.assignedIP`, then mints
@@ -342,7 +351,7 @@ an object to get stuck to do a job the garbage collector already does correctly.
   subnet is trivially outside the band, so the band check alone passed it, and the result is a VM
   whose default route points at an address its bridge cannot reach. The verdict is published as an
   `Available` condition. The remaining invariant, disjointness from other NADs on the subnet, is
-  **not** checkable any more once the shared NAD is retired, and becomes an admin responsibility
+  **not** checkable any more now that the shared NAD is retired, and becomes an admin responsibility
   bounded by RBAC: regular users cannot create NADs.
 - **Allocate** — on `IPRequest`, take the lowest free address in the pool. An address already in
   `status` is reused, never re-derived: a claim must not move because another claim appeared
@@ -454,22 +463,27 @@ until the pod goes), so the damage surfaces later. Ownership is what prevents it
 controller-owned by its claim, so nothing removes it while the claim lives.
 
 **R5 — Pool placement.** The `IPPool` range must be disjoint from any other NAD serving the same
-subnet. `.221–.240` is the band in the sample, sitting hard against the shared NAD's dynamic window
-rather than at the originally proposed `.150–.189`. Two corrections to the original text, both
-verified on 2026-09-28:
+subnet. `.221–.240` was the band drafted here, sitting hard against the shared NAD's dynamic window
+rather than at the originally proposed `.150–.189`; the pool that actually went live is `dev-ip-pool`,
+on `.200–.230`. Two corrections to the original text, both verified on 2026-09-28:
 
 - **MetalLB is not installed on this cluster** — no CRDs, no namespace — so there is no MetalLB
   pool to avoid. It has to be re-checked if MetalLB is ever installed on this subnet.
-- The Whereabouts dynamic window (`.200–.220`) belongs to the shared `vm-underlay-10-66-3-0` NAD.
-  Keeping the claim band adjacent to it rather than far below it means one comparison to make
-  during the cutover instead of two.
+- The Whereabouts dynamic window (`.200–.220`) belonged to the shared `vm-underlay-10-66-3-0` NAD.
+  That NAD was deleted on 2026-09-29, so **there is no longer a dynamic window on this subnet to
+  avoid** — the band choice was made while the window was live (adjacency rather than distance meant
+  one comparison during the cutover instead of two), and the cutover has now happened.
 
 **The disjointness requirement now depends on the pool's mode, which is a change from when this
-risk was written.** On a `whereabouts` pool, overlapping the dynamic window is survivable — both
-draw on the same ledger and the second `ADD` is refused. On a `static` pool it is not: the ledger
+risk was written.** On a `whereabouts` pool, overlapping another Whereabouts range is survivable —
+both draw on the same ledger and the second `ADD` is refused. On a `static` pool it is not: the ledger
 cannot see a static address, so it will hand a dynamic pod an address a claim already holds, with
-no CNI check anywhere. Overlapping a `static` band with the dynamic window is therefore the most
-dangerous configuration this API permits, and nothing in the code refuses it.
+no CNI check anywhere. Overlapping a `static` band with any other allocator's range is therefore the
+most dangerous configuration this API permits, and nothing in the code refuses it.
+
+That configuration is currently unreachable by accident on this subnet — the shared NAD is deleted,
+so there is no dynamic range left — but the property is about the *present*, not a guarantee. It comes
+back the moment anyone re-introduces a Whereabouts NAD or a second overlapping pool.
 
 The disjointness check itself retires as a controller check: with no live NAD to audit against it
 becomes an admin responsibility, bounded by RBAC — regular users cannot create NADs, so an overlap
@@ -483,10 +497,31 @@ recommends pinning an IP with the Multus `ips` annotation and claims Whereabouts
 Both cannot be right. This design does not depend on the annotation, but the conflicting guidance
 should be resolved (see spike 1).
 
-**R7 — The cutover is a migration, not a deploy.** Deleting the shared `vm-underlay-10-66-3-0` NAD
+**R7 — The cutover is a migration, not a deploy.** ~~Deleting the shared `vm-underlay-10-66-3-0` NAD
 cuts the network off from every VM and pod still attaching it (open question O7). Consumers have to
-move onto claims *first*; the NAD can only be deleted once nothing references it. Out of scope for
-the controller work, but it is the risk most likely to be underestimated.
+move onto claims *first*; the NAD can only be deleted once nothing references it.~~ **Carried out on
+2026-09-29, in that order, and the risk did not materialize.** The warning was correct as written: the
+reviewer's note says it is the risk most likely to be underestimated, and the mitigation is the whole
+of the work.
+
+What the cutover actually took, recorded because the *order* is the load-bearing part:
+
+1. **Sweep for references.** Fifteen checks across VMs, VMIs, pods, VirtualMachinePools, NADs, the
+   Whereabouts ledger and workloads carrying the `ips` annotation. One hit — `VirtualMachinePool`
+   `clq-cubestack-node` — which turned out to be a stale `last-applied-configuration` annotation, not
+   a live reference.
+2. **Fix the pool template, then delete.** The pool's template named member `0`'s NAD explicitly, so
+   it had to be corrected before the shared NAD could go. Changing a pool's `virtualMachineTemplate`
+   **restarts every member** — it does not merely set `RestartRequired`; measured here, the pool
+   controller's update was followed one second later by a graceful VMI shutdown. The member came back
+   on the same address, and survived a subsequent live migration — two `ADD`s on
+   `default/clq-cubestack-node-0-static` for `10.66.3.203`.
+3. **Delete, then verify.** A fifteen-check sweep is only as good as the moment it was run, so the
+   deletion was confirmed a no-op afterwards rather than assumed to be one.
+
+O7's answer, since it is what step 1 was for: nothing was cut off, because nothing was still
+attaching it. The residual risk the section describes is unchanged for the *general* case — the order
+still has to be sweep → fix → delete, and a future NAD retirement has to repeat it.
 
 **Open questions**
 
@@ -539,8 +574,11 @@ assumption is confirmed on real hardware rather than assumed.
 4. **Tooling** — a small CLI or thin API for "what is free / claim this / release this", plus the
    audit report. **Not done.**
 5. **Rollout** — pilot on cubestack VMs (whose IP is baked into cluster config and therefore the
-   strongest motivation), then general use. **Not started**, and it is a migration, not a deploy:
-   see R7. Choosing each pool's `ipam` mode is part of this step, not a detail of it.
+   strongest motivation), then general use. **The migration half of this step is done**: the shared
+   underlay NAD is deleted (2026-09-29), the pilot pool member claims its address and survives both a
+   restart and a live migration, and the admission policy injects the underlay reference so a pool
+   member derives its own NAD instead of sharing one. General use is not started — see R7 for what
+   the cutover took.
 
 ---
 
@@ -562,8 +600,13 @@ assumption is confirmed on real hardware rather than assumed.
   The controller was scaled to zero and the existing NAD's `ipam` block was edited in place, because
   `reconcileNAD` owns the whole config and would otherwise have reverted it. What that establishes
   is the mechanism: a `static` NAD is held by both pods across a live migration and the guest keeps
-  its address. What it does **not** establish is that `RenderNAD`'s own output is accepted by the
-  CNI on a real pod — the unit golden covers the bytes, and a rollout covers the rest.
+  its address. What it did **not** establish is that `RenderNAD`'s own output is accepted by the CNI
+  on a real pod — the unit golden covered the bytes only.
+  **That gap has since closed, by measurement on 2026-09-28.** A VM created with no `networks[]` at
+  all was injected with the underlay reference by the admission policy, claimed from the pool, and the
+  CNI logged a real `ADD` on the minted NAD: `Add pod… [10.66.3.205/24] from
+  default/vm-mapspike-static`. No `FailedCreatePodSandBox`. The same NAD was exercised again by the
+  pool member after the template fix, across a restart and a live migration.
 - The API shape in §5.1 and §5.4 is the implemented one, and it changed twice on 2026-09-28: first
   `subnet` and `gateway` moved from `IPPool.spec` into `IPPool.spec.nadTemplate`, leaving `range`
   as the only required field; then `nadTemplate.ipam` was added. Read those sections as a record of
@@ -575,13 +618,18 @@ assumption is confirmed on real hardware rather than assumed.
 
 ## Appendix A — commands used to establish §1 and §2
 
+**Kept verbatim as the record of how §2 was established. Two of these no longer work**, because the
+object they read is gone: the `vm-underlay-10-66-3-0` NAD was deleted on 2026-09-29, so both the
+`kubectl get nad … vm-underlay-10-66-3-0` call and the `10.66.3.205` reservation lookup (a lease held
+by the shared NAD's dynamic range) now return nothing. Use the pool instead — see the note in §2.
+
 ```bash
 export KUBECONFIG=~/.kube/kubeconfig.vm
 
-# the effective IPAM config lives in the NAD, not the IPPool CR
+# the effective IPAM config lived in the NAD, not the IPPool CR (NAD deleted 2026-09-29)
 kubectl get nad -n default vm-underlay-10-66-3-0 -o jsonpath='{.spec.config}'
 
-# the allocation binding that breaks on restart
+# the allocation binding that breaks on restart (lease released with the NAD)
 kubectl -n kube-system get overlappingrangeipreservations.whereabouts.cni.cncf.io \
   10.66.3.205 -o yaml
 

@@ -71,9 +71,46 @@ var _ = Describe("VirtualMachine Controller", func() {
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: "vm-basic-ip"}, claim)).To(Succeed())
 		Expect(claim.Spec.PoolRef).To(Equal("vm-pool"))
 		Expect(claim.Spec.NAD).To(Equal("vm-basic-static"))
+		// Written explicitly rather than left absent: the claim describes the policy
+		// it was created under, which is what makes the divergence check meaningful.
+		Expect(claim.Spec.Allocation).NotTo(BeNil())
+		Expect(claim.Spec.Allocation.Strategy).To(Equal(ipamv1alpha1.AllocationAuto))
+		Expect(claim.Spec.Allocation.Address).To(BeEmpty())
 		// The ownerReference is the whole release mechanism: no finalizer anywhere in
 		// the chain, so deleting the VM has to be enough.
 		Expect(metav1.IsControlledBy(claim, vm)).To(BeTrue())
+	})
+
+	It("requests the address named by the address annotation", func() {
+		createVM("default", "vm-addressed", map[string]string{
+			ipamv1alpha1.AnnotationPool:    "vm-pool",
+			ipamv1alpha1.AnnotationAddress: "10.66.3.160",
+		})
+		deleteClaim("default", "vm-addressed-ip")
+
+		reconcileVM("default", "vm-addressed")
+
+		claim := &ipamv1alpha1.IPRequest{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: "vm-addressed-ip"}, claim)).To(Succeed())
+		Expect(claim.Spec.Allocation).NotTo(BeNil())
+		Expect(claim.Spec.Allocation.Strategy).To(Equal(ipamv1alpha1.AllocationExact))
+		Expect(claim.Spec.Allocation.Address).To(Equal("10.66.3.160"))
+	})
+
+	It("creates no claim for a malformed address annotation", func() {
+		// The address is validated by the claim's schema, so the create is rejected
+		// rather than producing a claim that will fail forever. Reconciling is not a
+		// retry loop: any edit to the annotation re-triggers it.
+		createVM("default", "vm-bad-address", map[string]string{
+			ipamv1alpha1.AnnotationPool:    "vm-pool",
+			ipamv1alpha1.AnnotationAddress: "not-an-ip",
+		})
+		deleteClaim("default", "vm-bad-address-ip")
+
+		reconcileVM("default", "vm-bad-address")
+
+		err := k8sClient.Get(ctx, client.ObjectKey{Namespace: "default", Name: "vm-bad-address-ip"}, &ipamv1alpha1.IPRequest{})
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
 	})
 
 	It("honours the nad-name annotation", func() {

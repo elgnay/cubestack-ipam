@@ -199,11 +199,34 @@ helm-crds-check: manifests ## Verify the chart's crds/ has not drifted from conf
 		diff -rq config/crd/bases $(CHART_DIR)/crds >&2; exit 1; }
 
 .PHONY: helm-lint
-helm-lint: helm-crds-check ## Lint the chart and render it.
+helm-lint: helm-crds-check ## Lint the chart and render it, including every injection-policy branch.
 	"$(HELM)" lint $(CHART_DIR)
 	@out="$$( "$(HELM)" template cubestack-ipam $(CHART_DIR) --namespace $(HELM_NAMESPACE) )"; \
 	if [ -z "$$out" ]; then echo "helm template rendered nothing" >&2; exit 1; fi; \
 	echo "helm template: $$(printf '%s\n' "$$out" | grep -c '^kind:') objects"
+	@# The injection policy renders or not depending on what the cluster serves, and that
+	@# detection is the subtle part of this chart: it reads discovery where discovery has
+	@# run, and the kube version where it has not -- and a wrong answer is a SILENT no-op.
+	@# So every branch is rendered and counted, not just the default one.
+	@n=$$( "$(HELM)" template cubestack-ipam $(CHART_DIR) --kube-version 1.35.4 | grep -c '^kind: MutatingAdmissionPolicy$$' ); \
+		[ "$$n" = 1 ] || { echo "kube 1.35.4: want 1 injection policy, got $$n" >&2; exit 1; }; \
+		echo "injection policy: rendered on 1.35.4 (v1beta1)"
+	@n=$$( "$(HELM)" template cubestack-ipam $(CHART_DIR) --kube-version 1.36.0 | grep -c '^kind: MutatingAdmissionPolicy$$' ); \
+		[ "$$n" = 1 ] || { echo "kube 1.36.0: want 1 injection policy, got $$n" >&2; exit 1; }; \
+		echo "injection policy: rendered on 1.36.0 (v1)"
+	@# A cluster that reported its resources but does not serve MutatingAdmissionPolicy --
+	@# a 1.35 (or 1.34) without the feature gate. apps/v1/Deployment is the canary that
+	@# says discovery ran at all.
+	@n=$$( "$(HELM)" template cubestack-ipam $(CHART_DIR) --kube-version 1.35.4 --api-versions apps/v1/Deployment | grep -c '^kind: MutatingAdmissionPolicy$$' ); \
+		[ "$$n" = 0 ] || { echo "gate off: want the policy skipped, got $$n" >&2; exit 1; }; \
+		echo "injection policy: skipped where discovery says the gate is off"
+	@n=$$( "$(HELM)" template cubestack-ipam $(CHART_DIR) --set map.enabled=false | grep -c '^kind: MutatingAdmissionPolicy$$' ); \
+		[ "$$n" = 0 ] || { echo "map.enabled=false: want the policy skipped, got $$n" >&2; exit 1; }; \
+		echo "injection policy: skipped when map.enabled=false"
+	@# An empty namespace list is refused, not widened to the whole cluster.
+	@if "$(HELM)" template cubestack-ipam $(CHART_DIR) --set map.namespaces= >/dev/null 2>&1; then \
+		echo "map.namespaces=[] was accepted; it must be refused" >&2; exit 1; \
+	else echo "injection policy: rejected an empty map.namespaces"; fi
 
 .PHONY: helm-install
 helm-install: helm-crds-check ## Install or upgrade the chart.

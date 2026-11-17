@@ -1,0 +1,50 @@
+# A reserved block of addresses, drawn from an existing pool.
+#
+# This sample is deliberately NOT listed in kustomization.yaml, unlike the others.
+# Every sample there shares dev-ip-pool, and this one takes the lowest free
+# addresses in it -- exactly where the IPRequest sample and the VirtualMachine
+# sample expect to land. Apply it instead of those, not alongside them.
+#
+# There is no approval step, no IPPool created and no NAD minted: this is a
+# user-scope operation, the same as claiming a single address. The addresses are
+# recorded for you to configure something with.
+apiVersion: ipam.cubestack.io/v1alpha1
+kind: IPRangeRequest
+metadata:
+  labels:
+    app.kubernetes.io/name: cubestack-ipam
+    app.kubernetes.io/managed-by: kustomize
+  name: blk-cubestack
+  namespace: default
+spec:
+  # IPPool is cluster-scoped, so this is a bare name with no namespace.
+  poolRef: dev-ip-pool
+
+  # What to claim.
+  #
+  #   allocation:
+  #     strategy: Auto
+  #     count: 8          # the lowest free run of this size
+  #
+  # Or name the band:
+  #
+  #   allocation:
+  #     strategy: Exact
+  #     range:
+  #       start: 10.66.3.208
+  #       end: 10.66.3.215
+  #
+  # Exact is not a hint. If any address in the band is outside the pool, excluded
+  # by it, or already held, the request fails and status.blockers names the claims
+  # and blocks in the way. The band is never moved to the nearest free run.
+  #
+  # The whole allocation is immutable. Changing it would move addresses out from
+  # under whatever was configured with the block, so a different block is a
+  # different request.
+  allocation:
+    strategy: Auto
+    count: 8
+
+  # Nothing consumes the block on your behalf. Deleting this object frees the
+  # addresses immediately and the next claim or block will be given them, so delete
+  # it only once whatever was configured with them has stopped using them.

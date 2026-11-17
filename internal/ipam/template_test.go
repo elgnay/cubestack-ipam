@@ -27,8 +27,10 @@ import (
 
 func ptr[T any](v T) *T { return &v }
 
-// The full template: everything the vm-underlay-10-66-3-0 NAD carries today. The
-// addressing is part of the template now, so it is here rather than passed
+// The full template: everything the vm-underlay-10-66-3-0 NAD used to carry. That
+// NAD was deleted on 2026-09-29, so this fixture is now the only place that shape
+// is written down -- the pool's nadTemplate is what declares it in a live cluster.
+// The addressing is part of the template now, so it is here rather than passed
 // alongside; only the assigned address is injected per claim.
 //
 // It carries IPAMStatic, which is what the deployed pool uses. The whereabouts form

@@ -315,4 +315,215 @@ var _ = Describe("IPRequest Controller", func() {
 		Expect(apimeta.FindStatusCondition(got.Status.Conditions, ipamv1alpha1.ConditionTemplateMissing)).To(BeNil())
 		Expect(got.Status.AssignedIP).To(Equal(testFirstIP))
 	})
+
+	// The two specs below are the cross-kind contract, and the reason takenInPool
+	// reads both kinds rather than only claims. Before it did, a block delegated out
+	// of a pool was invisible to this allocator: the claim would land in the middle
+	// of it, the VM's NAD would carry an address something outside the cluster was
+	// already using, and nothing in the CNI would refuse the duplicate. Losing either
+	// of these silently reopens that, which is why both directions are pinned.
+
+	It("does not place a claim inside a delegated block", func() {
+		createPool("cross-block", testBlockPoolSpec())
+		createRangeRequest("default", "cross-block", "cross-block", 3)
+		reconcileRange("default", "cross-block")
+		Expect(getRangeRequest("default", "cross-block").Status.Start).To(Equal(testFirstIP))
+
+		createClaim("default", "cross-block-ip", "cross-block", "")
+
+		reconcileClaim("default", "cross-block-ip")
+
+		// The lowest free address in the band is .150, and it is inside the block.
+		// The claim has to take the first address after it instead.
+		got := getClaim("default", "cross-block-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseBound))
+		Expect(got.Status.AssignedIP).To(Equal(testFourthIP))
+	})
+
+	It("makes the next block skip an address a claim already holds", func() {
+		createPool("cross-claim", testBlockPoolSpec())
+		bindClaim("default", "cross-claim-ip", "cross-claim", testFirstIP)
+		createRangeRequest("default", "cross-claim-block", "cross-claim", 3)
+
+		reconcileRange("default", "cross-claim-block")
+
+		// Not .150-.152: the first address of that run is held by a claim, and a
+		// block has to be contiguous, so the whole run moves up by one.
+		got := getRangeRequest("default", "cross-claim-block")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRangeRequestPhaseBound))
+		Expect(got.Status.Start).To(Equal(testSecondIP))
+		Expect(got.Status.End).To(Equal(testFourthIP))
+	})
+
+	// --- Exact allocation ---------------------------------------------------
+
+	ready := func(claim *ipamv1alpha1.IPRequest) *metav1.Condition {
+		cond := apimeta.FindStatusCondition(claim.Status.Conditions, ipamv1alpha1.ConditionReady)
+		ExpectWithOffset(1, cond).NotTo(BeNil())
+		return cond
+	}
+
+	It("binds the address the claim asked for, not the lowest free one", func() {
+		// The whole feature: a caller who needs .152 gets .152, not .150 because it
+		// happens to come first.
+		createPool("claims-exact", testPoolSpec())
+		createExactClaim("default", "claims-exact-ip", "claims-exact", testThirdIP)
+
+		reconcileClaim("default", "claims-exact-ip")
+
+		got := getClaim("default", "claims-exact-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseBound))
+		Expect(got.Status.AssignedIP).To(Equal(testThirdIP))
+		Expect(got.Status.Blockers).To(BeEmpty())
+	})
+
+	It("fails rather than substituting another address when the requested one is held", func() {
+		// No fallback. A typo has to look like a typo; silently landing on .150 when
+		// .152 was asked for would make the request unverifiable.
+		createPool("claims-exact-taken", testPoolSpec())
+		bindClaim("default", "claims-exact-taken-a", "claims-exact-taken", testSecondIP)
+		createExactClaim("default", "claims-exact-taken-b", "claims-exact-taken", testSecondIP)
+
+		reconcileClaim("default", "claims-exact-taken-b")
+
+		got := getClaim("default", "claims-exact-taken-b")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseFailed))
+		Expect(got.Status.AssignedIP).To(BeEmpty())
+		Expect(ready(got).Reason).To(Equal(ipamv1alpha1.ReasonAddressUnavailable))
+
+		// The structured half: the holder is named, so a reader can go straight to it
+		// instead of searching the pool by hand.
+		Expect(got.Status.Blockers).To(HaveLen(1))
+		Expect(got.Status.Blockers[0]).To(Equal(ipamv1alpha1.Blocker{
+			Kind:      "IPRequest",
+			Namespace: "default",
+			Name:      "claims-exact-taken-a",
+			Address:   testSecondIP,
+		}))
+
+		// Deleting the holder frees the address, and the waiting claim then binds. The
+		// delete watch is what makes this happen without touching the waiter, but the
+		// suite drives the reconcile by hand just as it does everywhere else.
+		Expect(k8sClient.Delete(ctx, getClaim("default", "claims-exact-taken-a"))).To(Succeed())
+		Eventually(func() bool {
+			return apierrors.IsNotFound(k8sClient.Get(ctx,
+				types.NamespacedName{Namespace: "default", Name: "claims-exact-taken-a"}, &ipamv1alpha1.IPRequest{}))
+		}).Should(BeTrue())
+
+		reconcileClaim("default", "claims-exact-taken-b")
+
+		after := getClaim("default", "claims-exact-taken-b")
+		Expect(after.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseBound))
+		Expect(after.Status.AssignedIP).To(Equal(testSecondIP))
+		Expect(after.Status.Blockers).To(BeEmpty())
+	})
+
+	It("reports a requested address outside the pool's range", func() {
+		createPool("claims-exact-outside", testPoolSpec())
+		createExactClaim("default", "claims-exact-outside-ip", "claims-exact-outside", "10.66.3.99")
+
+		reconcileClaim("default", "claims-exact-outside-ip")
+
+		got := getClaim("default", "claims-exact-outside-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseFailed))
+		Expect(ready(got).Reason).To(Equal(ipamv1alpha1.ReasonAddressOutOfRange))
+		Expect(got.Status.AssignedIP).To(BeEmpty())
+	})
+
+	It("reports a requested address inside a pool exclusion", func() {
+		// Distinct from unavailable: the address is free, and the fix is to change the
+		// pool's reservation rather than to release a holder. The blocker names the
+		// pool so the reader knows which object to edit.
+		spec := testPoolSpec()
+		spec.Allocation = &ipamv1alpha1.PoolAllocation{
+			Exclude: []ipamv1alpha1.IPRange{{Start: testFirstIP, End: testFirstIP}},
+		}
+		createPool("claims-exact-excluded", spec)
+		createExactClaim("default", "claims-exact-excluded-ip", "claims-exact-excluded", testFirstIP)
+
+		reconcileClaim("default", "claims-exact-excluded-ip")
+
+		got := getClaim("default", "claims-exact-excluded-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseFailed))
+		Expect(ready(got).Reason).To(Equal(ipamv1alpha1.ReasonAddressExcluded))
+		Expect(got.Status.Blockers).To(HaveLen(1))
+		Expect(got.Status.Blockers[0].Kind).To(Equal("IPPool"))
+		Expect(got.Status.Blockers[0].Name).To(Equal("claims-exact-excluded"))
+		Expect(got.Status.Blockers[0].Range).NotTo(BeNil())
+		Expect(got.Status.Blockers[0].Range.Start).To(Equal(testFirstIP))
+	})
+
+	It("reports an Exact request against a pool that forbids it", func() {
+		allow := false
+		spec := testPoolSpec()
+		spec.Allocation = &ipamv1alpha1.PoolAllocation{AllowExact: &allow}
+		createPool("claims-exact-denied", spec)
+		createExactClaim("default", "claims-exact-denied-ip", "claims-exact-denied", testFirstIP)
+
+		reconcileClaim("default", "claims-exact-denied-ip")
+
+		got := getClaim("default", "claims-exact-denied-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseFailed))
+		Expect(ready(got).Reason).To(Equal(ipamv1alpha1.ReasonExactNotAllowed))
+	})
+
+	It("reports a delegated block as the blocker for a requested address", func() {
+		// The cross-kind case again, now on the Exact path: the holder is an
+		// IPRangeRequest, and the blocker has to say so with the band, or a reader
+		// looking for an IPRequest by that name would find nothing.
+		createPool("claims-exact-block", testBlockPoolSpec())
+		createRangeRequest("default", "claims-exact-block-blk", "claims-exact-block", 3)
+		reconcileRange("default", "claims-exact-block-blk")
+
+		createExactClaim("default", "claims-exact-block-ip", "claims-exact-block", testSecondIP)
+		reconcileClaim("default", "claims-exact-block-ip")
+
+		got := getClaim("default", "claims-exact-block-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseFailed))
+		Expect(ready(got).Reason).To(Equal(ipamv1alpha1.ReasonAddressUnavailable))
+		Expect(got.Status.Blockers).To(HaveLen(1))
+		Expect(got.Status.Blockers[0].Kind).To(Equal("IPRangeRequest"))
+		Expect(got.Status.Blockers[0].Name).To(Equal("claims-exact-block-blk"))
+		Expect(got.Status.Blockers[0].Range).NotTo(BeNil())
+		Expect(got.Status.Blockers[0].Range.Start).To(Equal(testFirstIP))
+		Expect(got.Status.Blockers[0].Range.End).To(Equal(testThirdIP))
+	})
+
+	It("keeps an Auto claim out of an excluded band", func() {
+		// Exclusions apply to every strategy: an address reserved by the admin is not
+		// handed out just because the caller did not name it.
+		spec := testPoolSpec()
+		spec.Allocation = &ipamv1alpha1.PoolAllocation{
+			Exclude: []ipamv1alpha1.IPRange{{Start: testFirstIP, End: testSecondIP}},
+		}
+		createPool("claims-auto-excluded", spec)
+		createClaim("default", "claims-auto-excluded-ip", "claims-auto-excluded", "")
+
+		reconcileClaim("default", "claims-auto-excluded-ip")
+
+		got := getClaim("default", "claims-auto-excluded-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseBound))
+		Expect(got.Status.AssignedIP).To(Equal(testThirdIP))
+	})
+
+	It("retains an exact address that has drifted out of range", func() {
+		// Sticky, as everywhere: the NAD still carries the address, so narrowing the
+		// pool must not move it. The request reports the drift instead.
+		createPool("claims-exact-drift", testPoolSpec())
+		createExactClaim("default", "claims-exact-drift-ip", "claims-exact-drift", testThirdIP)
+		reconcileClaim("default", "claims-exact-drift-ip")
+		Expect(getClaim("default", "claims-exact-drift-ip").Status.AssignedIP).To(Equal(testThirdIP))
+
+		pool := &ipamv1alpha1.IPPool{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: "claims-exact-drift"}, pool)).To(Succeed())
+		pool.Spec.Range = ipamv1alpha1.IPRange{Start: testFirstIP, End: testSecondIP}
+		Expect(k8sClient.Update(ctx, pool)).To(Succeed())
+
+		reconcileClaim("default", "claims-exact-drift-ip")
+
+		got := getClaim("default", "claims-exact-drift-ip")
+		Expect(got.Status.Phase).To(Equal(ipamv1alpha1.IPRequestPhaseFailed))
+		Expect(ready(got).Reason).To(Equal(ipamv1alpha1.ReasonRangeInvalid))
+		Expect(got.Status.AssignedIP).To(Equal(testThirdIP))
+	})
 })

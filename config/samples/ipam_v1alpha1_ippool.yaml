@@ -4,9 +4,13 @@ metadata:
   labels:
     app.kubernetes.io/name: cubestack-ipam
     app.kubernetes.io/managed-by: kustomize
-  name: cubestack-static-v4
+  name: dev-ip-pool
 spec:
   # Cluster-scoped: an admin creates this, users claim from it.
+  #
+  # The name and band here are the ones live on the cluster as of 2026-09-29, so
+  # this sample can be applied as-is. It replaced an earlier `cubestack-static-v4`
+  # at .221-.240; that pool is gone.
   #
   # range is the ONLY required field. It is what the allocator needs; everything
   # the minted network config needs lives in nadTemplate below, and is required
@@ -14,32 +18,54 @@ spec:
   # addresses and mints nothing, so it needs no subnet and no gateway -- see
   # ipam_v1alpha1_ippool_minimal.yaml.
   #
-  # The band must be disjoint from any other NAD serving the same subnet. That is
-  # an admin responsibility rather than a controller check: regular users cannot
+  # The band must be disjoint from every other allocator on the same subnet: other
+  # pools, any Whereabouts NAD, and (if it is ever installed here) MetalLB. That is
+  # an admin responsibility rather than a controller check -- regular users cannot
   # create NADs, so an overlap can only be introduced deliberately, by an admin.
-  # Once the shared vm-underlay-10-66-3-0 NAD is retired, this pool is the only
-  # thing serving the space and there is nothing left for it to overlap with.
+  #
+  # Nothing enforces it, and under `ipam: static` below nothing even notices it:
+  # the Whereabouts ledger cannot see a static address, so an overlapping dynamic
+  # range would hand a pod an address a claim already holds, with no CNI check
+  # anywhere. Band choice is the whole of the protection.
+  #
+  # On this cluster the shared vm-underlay-10-66-3-0 NAD (Whereabouts .200-.220)
+  # was DELETED on 2026-09-29, so there is currently no dynamic range on
+  # 10.66.3.0/24 to avoid and this band overlaps nothing. That is a fact about
+  # today, not a property of the design -- it comes back the moment anyone
+  # re-creates a Whereabouts NAD on this subnet.
+  #
+  # The pool's own allocator is a single writer over `range`, so claims from this
+  # pool cannot collide with each other; the sweep's DuplicateAddress event is the
+  # detector of record for everything else. See the ipam field below.
   #
   # MetalLB is NOT installed on this cluster (no CRDs, no namespace, verified
   # 2026-09-28), so there is no MetalLB pool to avoid. If it is ever installed on
   # this subnet, this band has to be re-checked against it.
-  #
-  # .221-.240 sits immediately above the shared vm-underlay-10-66-3-0 NAD's
-  # dynamic window (.200-.220), so the two cannot contend: Whereabouts hands out
-  # .200-.220 to dynamically-addressed pods and this pool hands out .221-.240 to
-  # claims. Both bands are disjoint from the ledger's eight existing allocations,
-  # all in .200-.208.
-  #
-  # That split matters MORE with ipam: static than it did before, because the CNI
-  # no longer refuses a duplicate -- this band being disjoint from the dynamic
-  # window is now the only thing keeping a claim out of an address a pod already
-  # holds. See the ipam field below.
-  #
-  # The design originally proposed .150-.189 for this subnet; this band replaces
-  # it to sit hard against the dynamic window rather than leaving a gap.
   range:
-    start: 10.66.3.221
-    end: 10.66.3.240
+    start: 10.66.3.200
+    end: 10.66.3.230
+
+  # Optional allocation policy. Omitting it allows Exact requests and reserves
+  # nothing, which is the behaviour every pool had before these fields existed.
+  #
+  #   allocation:
+  #     # allowExact defaults to true. Set it to false to force every claim on this
+  #     # pool to use strategy Auto.
+  #     allowExact: true
+  #
+  #     # Bands the allocator must never hand out, under either strategy. Each must
+  #     # lie inside range above. This is how an address is reserved for something
+  #     # that is not a claim -- another system's fixed address, say -- rather than
+  #     # by hoping no claim lands on it.
+  #     exclude:
+  #       - start: 10.66.3.200
+  #         end: 10.66.3.200
+  #
+  # An exclusion added after an address was already allocated does not move that
+  # holder; addresses are sticky. Delete the claim first to reclaim it.
+  #
+  # Exclusions are enforced by this allocator, not by the CNI. On a static pool
+  # that is the only enforcement there is.
 
   # Optional: everything the per-VM NADs should contain. Present means this pool
   # mints networks; a claim that asks for a NAD against a pool without one fails
@@ -49,9 +75,10 @@ spec:
   # is set. A template is therefore all-or-nothing, which is also why there is no
   # rule anywhere saying so -- the field list is the rule.
   #
-  # These are the values the shared vm-underlay-10-66-3-0 NAD carried. Nothing
-  # reads that NAD any more; they live here now so the pool describes the underlay
-  # by itself.
+  # These are the values the shared vm-underlay-10-66-3-0 NAD carried. That NAD has
+  # been deleted (2026-09-29) and nothing reads it; these values live here now so
+  # the pool describes the underlay by itself. This template is the sole
+  # declaration of what a minted NAD on this subnet contains.
   nadTemplate:
     # The CIDR the minted NADs' addresses belong to. It supplies their prefix
     # length and the containment check, and in the whereabouts mode below it also

@@ -1,8 +1,26 @@
 {{- if and .Values.rbac.create .Values.rbac.helperRoles }}
 {{/*
-  Admin/Editor/Viewer roles for the two CRDs, matching what kubebuilder scaffolds in
-  config/rbac for cluster admins to delegate with. The manager itself uses none of
-  them.
+  Admin/Editor/Viewer roles for IPPool and IPRequest, and a Viewer role for
+  IPRangeRequest, matching what kubebuilder scaffolds in config/rbac for cluster admins
+  to delegate with. The manager itself uses none of them.
+
+  WHY IPRangeRequest GETS ONLY A VIEWER. A block is a resource reservation with no
+  guard behind it: the addresses are handed over for something outside this cluster to
+  be configured with, and deleting the object frees them while that consumer keeps
+  using them. Only the auditor would ever notice. That is a grant worth making
+  deliberately, per team, against a named pool -- so this chart does not ship a
+  ClusterRole that makes it a one-line binding. Read the Viewer role as "you can see
+  what is reserved and by whom", and write the write-grant yourself:
+
+    apiGroups: [ipam.cubestack.io]
+    resources: [iprangerequests]
+    verbs: [create, get, list, watch]
+
+  Scope it with a namespaced Role + RoleBinding, not a ClusterRole: IPRangeRequest is
+  namespaced, and there is no reason for a team to reserve blocks in someone else's
+  namespace. Deleting one is part of releasing a block, so add `delete` only if the
+  same team should be able to release its own -- the release is immediate and
+  unguarded, which is why it is not in the list above.
 
   READ THE CAVEAT BEFORE HANDING THE EDITOR ROLE TO A USER.
 
@@ -157,6 +175,29 @@ rules:
   - ipam.cubestack.io
   resources:
   - iprequests/status
+  verbs:
+  - get
+---
+{{/* Viewer only -- read the caveat at the top of this file before adding an editor. */}}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "cubestack-ipam.fullname" . }}-iprangerequest-viewer-role
+  labels:
+    {{- include "cubestack-ipam.labels" . | nindent 4 }}
+rules:
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprangerequests
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ipam.cubestack.io
+  resources:
+  - iprangerequests/status
   verbs:
   - get
 {{- end }}

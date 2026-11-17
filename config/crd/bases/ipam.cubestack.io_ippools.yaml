@@ -11,6 +11,8 @@ spec:
     kind: IPPool
     listKind: IPPoolList
     plural: ippools
+    shortNames:
+    - ipp
     singular: ippool
   scope: Cluster
   versions:
@@ -55,6 +57,63 @@ spec:
           spec:
             description: spec defines the desired state of IPPool
             properties:
+              allocation:
+                description: |-
+                  allocation is the admin's policy for the allocator: bands reserved from every
+                  request, and whether callers may ask for an address by name.
+
+                  Optional, and its absence means "exact requests allowed, nothing excluded".
+                  That default keeps the two behaviours this field governs discoverable without
+                  making every existing pool carry an empty block.
+                properties:
+                  allowExact:
+                    default: true
+                    description: |-
+                      allowExact controls whether callers may use strategy Exact against this pool.
+                      It defaults to true; set it to false to keep a pool Auto-only.
+
+                      This is a coarse control, not a security boundary. Anyone who can create an
+                      IPRequest can already consume the pool's addresses with Auto requests; exact
+                      only changes which ones they land on. Use exclude for the addresses that
+                      actually matter.
+                    type: boolean
+                  exclude:
+                    description: |-
+                      exclude is a list of inclusive bands that the pool will never allocate,
+                      whatever the strategy. It is how an admin reserves addresses for things that
+                      are not claims: a gateway on a wider band, a cluster-service address, or a
+                      block handed to another system.
+
+                      Exclusions are enforced by the allocator, not by the CNI. On a static pool
+                      that is the only enforcement there is; on a whereabouts pool the CNI would
+                      refuse a duplicate of a pod's address, but it has never heard of this band.
+                      Each band must lie within spec.range, and the bounds are checked in Go because
+                      CEL has no ordering overload on IP values.
+
+                      An exclusion added after an address was already allocated does NOT move the
+                      holder. Addresses are sticky, as everywhere in this API: release the claim
+                      first if the address has to be reclaimed.
+                    items:
+                      description: |-
+                        IPRange is an inclusive address band. Both bounds are required. A band holding
+                        a single address is expressed as start == end — that is the shape the
+                        controller generates per-VM NADs from, so it is deliberately representable.
+                      properties:
+                        end:
+                          description: end is the last address in the band (inclusive).
+                          pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                          type: string
+                        start:
+                          description: start is the first address in the band (inclusive).
+                          pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                          type: string
+                      required:
+                      - end
+                      - start
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                type: object
               nadTemplate:
                 description: |-
                   nadTemplate is the network config cloned into every NAD this pool mints,

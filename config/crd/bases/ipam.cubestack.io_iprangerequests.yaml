@@ -1,0 +1,310 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.22.0
+  name: iprangerequests.ipam.cubestack.io
+spec:
+  group: ipam.cubestack.io
+  names:
+    kind: IPRangeRequest
+    listKind: IPRangeRequestList
+    plural: iprangerequests
+    shortNames:
+    - iprr
+    singular: iprangerequest
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.poolRef
+      name: Pool
+      type: string
+    - jsonPath: .spec.allocation.count
+      name: Count
+      type: integer
+    - jsonPath: .spec.allocation.range.start
+      name: Requested
+      type: string
+    - jsonPath: .status.start
+      name: Start
+      type: string
+    - jsonPath: .status.end
+      name: End
+      type: string
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: IPRangeRequest is the Schema for the iprangerequests API
+        properties:
+          apiVersion:
+            description: |-
+              APIVersion defines the versioned schema of this representation of an object.
+              Servers should convert recognized schemas to the latest internal value, and
+              may reject unrecognized values.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources
+            type: string
+          kind:
+            description: |-
+              Kind is a string value representing the REST resource this object represents.
+              Servers may infer this from the endpoint the client submits requests to.
+              Cannot be updated.
+              In CamelCase.
+              More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+            type: string
+          metadata:
+            type: object
+          spec:
+            description: spec defines the desired state of IPRangeRequest
+            properties:
+              allocation:
+                description: |-
+                  allocation chooses the block: Auto with a count, or Exact with an inclusive
+                  range.
+
+                  Required. There is no sensible default between "give me any three free
+                  addresses" and "give me exactly these three", and picking one silently would
+                  make the other a surprise.
+
+                  Immutable. Changing it would move addresses out from under whatever was
+                  configured with the block; a different block is a different request.
+                properties:
+                  count:
+                    description: |-
+                      count is how many contiguous addresses an Auto request claims.
+
+                      The upper bound mirrors ipam.MaxRangeSize, the ceiling ParseRange applies to
+                      a pool band — a block cannot be larger than the band it is drawn from. The
+                      two are necessarily duplicated, since a CEL marker cannot reference a Go
+                      constant; TestMaxRangeSize pins this side's counterpart and the controller
+                      suite's "rejects a count above the range ceiling" spec pins the schema.
+                    format: int32
+                    maximum: 65536
+                    minimum: 1
+                    type: integer
+                  range:
+                    description: |-
+                      range is the inclusive band an Exact request requires. Both bounds are
+                      inside the pool's spec.range and outside its exclusions, and no address in
+                      the band may be held by another claim or block.
+                    properties:
+                      end:
+                        description: end is the last address in the band (inclusive).
+                        pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                        type: string
+                      start:
+                        description: start is the first address in the band (inclusive).
+                        pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                        type: string
+                    required:
+                    - end
+                    - start
+                    type: object
+                  strategy:
+                    default: Auto
+                    description: strategy selects who chooses the block. Omitted means
+                      Auto.
+                    enum:
+                    - Auto
+                    - Exact
+                    type: string
+                required:
+                - strategy
+                type: object
+                x-kubernetes-validations:
+                - message: strategy Exact requires allocation.range and forbids allocation.count;
+                    strategy Auto requires allocation.count and forbids allocation.range
+                  rule: 'self.strategy == ''Exact'' ? (has(self.range) && !has(self.count))
+                    : (has(self.count) && !has(self.range))'
+                - message: 'allocation is immutable: a block belongs to whatever was
+                    configured with it, and resizing or moving it would free addresses
+                    still in use. Delete this request and create a new one of the
+                    size and place you need.'
+                  rule: self == oldSelf
+              poolRef:
+                description: |-
+                  poolRef names the IPPool to draw the block from. IPPool is cluster-scoped, so
+                  this is a bare name with no namespace.
+
+                  Immutable. The block belongs to the pool it was drawn from, and re-pointing
+                  the reference would silently free the old addresses while whatever was
+                  configured with them kept using them. Delete the request and create a new one
+                  against the other pool.
+                minLength: 1
+                type: string
+                x-kubernetes-validations:
+                - message: 'poolRef is immutable: a block belongs to the pool it was
+                    drawn from, and re-pointing it would free addresses a consumer
+                    may still be using. Delete this request and create a new one against
+                    the other pool.'
+                  rule: self == oldSelf
+            required:
+            - allocation
+            - poolRef
+            type: object
+          status:
+            description: status defines the observed state of IPRangeRequest
+            properties:
+              blockers:
+                description: |-
+                  blockers names the holders standing in the way of an Exact request.
+
+                  Empty for Auto requests. On a failed Exact request this is the actionable
+                  half of the condition: each entry is a claim whose address falls in the
+                  requested band or a block it overlaps, and can be looked up directly. Cleared
+                  when the request binds.
+                items:
+                  description: |-
+                    Blocker names one object that stands between an Exact allocation and success.
+
+                    It is deliberately structured rather than only a sentence: the usual next step
+                    is to look at the holder, delete it if it is stale, or choose another address,
+                    and a name to look up is what makes that possible. Reason strings stay on the
+                    condition; this list is the detail behind "AddressUnavailable" or
+                    "RangeUnavailable".
+                  properties:
+                    address:
+                      description: |-
+                        address is the single address the holder owns, when the blocker is an
+                        IPRequest.
+                      type: string
+                    kind:
+                      description: 'kind is the holder''s kind: IPRequest or IPRangeRequest.'
+                      type: string
+                    name:
+                      description: name is the holder's name.
+                      type: string
+                    namespace:
+                      description: namespace is the holder's namespace. Empty for
+                        cluster-scoped kinds.
+                      type: string
+                    range:
+                      description: |-
+                        range is the block the holder owns, when the blocker is an IPRangeRequest,
+                        or the pool exclusion that covers the request.
+                      properties:
+                        end:
+                          description: end is the last address in the band (inclusive).
+                          pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                          type: string
+                        start:
+                          description: start is the first address in the band (inclusive).
+                          pattern: ^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$
+                          type: string
+                      required:
+                      - end
+                      - start
+                      type: object
+                  required:
+                  - kind
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-type: atomic
+              conditions:
+                description: |-
+                  conditions represent the current state of the IPRangeRequest resource.
+                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
+
+                  Condition types set here:
+                  - "Ready": True once a block is recorded in status.start and status.end. The
+                    cause of a False goes in the condition's reason, e.g. "PoolNotFound",
+                    "RangeInvalid", "RangeExhausted" or "RangeFragmented"; an Exact request that
+                    cannot have the band it named adds "RangeOutOfRange", "RangeExcluded",
+                    "RangeUnavailable", "ExactNotAllowed" or "AllocationInvalid", with the holders
+                    in status.blockers -- there is no separate "Degraded" type, which would be its
+                    exact complement and could drift out of step with it.
+
+                  The status of each condition is one of True, False, or Unknown.
+                items:
+                  description: Condition contains details for one aspect of the current
+                    state of this API Resource.
+                  properties:
+                    lastTransitionTime:
+                      description: |-
+                        lastTransitionTime is the last time the condition transitioned from one status to another.
+                        This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                      format: date-time
+                      type: string
+                    message:
+                      description: |-
+                        message is a human readable message indicating details about the transition.
+                        This may be an empty string.
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      description: |-
+                        observedGeneration represents the .metadata.generation that the condition was set based upon.
+                        For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date
+                        with respect to the current state of the instance.
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      description: |-
+                        reason contains a programmatic identifier indicating the reason for the condition's last transition.
+                        Producers of specific condition types may define expected values and meanings for this field,
+                        and whether the values are considered a guaranteed API.
+                        The value should be a CamelCase string.
+                        This field may not be empty.
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      description: status of the condition, one of True, False, Unknown.
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              end:
+                description: |-
+                  end is the last address of the assigned block, once bound. Inclusive, so a
+                  request for one address has start == end.
+
+                  Together with start this is the whole record of the block: the ledger that
+                  stops a later claim from landing inside it is built by expanding these two
+                  fields, so a bound request with no start/end holds nothing.
+                type: string
+              phase:
+                description: phase summarises the request's lifecycle.
+                enum:
+                - Pending
+                - Bound
+                - Failed
+                type: string
+              start:
+                description: start is the first address of the assigned block, once
+                  bound.
+                type: string
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

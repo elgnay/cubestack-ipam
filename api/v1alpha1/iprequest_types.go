@@ -51,10 +51,22 @@ const (
 // the controller assigns an address from the referenced pool, and — when nad is
 // set — mints a per-VM NetworkAttachmentDefinition carrying that address as a
 // single static assignment (design §5.2 steps 3-4).
+//
+// spec.allocation chooses who picks the address. Omitting it means Auto: the
+// controller takes the lowest free address, exactly as before the field existed.
+// Exact names an address, and the controller either binds that address or fails
+// with the conflicting holders in status.blockers. It never substitutes another
+// address.
 type IPRequestSpec struct {
 	// poolRef names the IPPool to claim from. IPPool is cluster-scoped, so this is
 	// a bare name with no namespace.
+	//
+	// Immutable. A claim's address is allocated against one pool's ledger, and
+	// re-pointing the reference would free that address in the old pool while
+	// anything configured with it — the minted NAD above all — kept using it. The
+	// addresses belong to a pool; moving a claim between pools is a new claim.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="poolRef is immutable: a claim's address belongs to the pool it was allocated from, and re-pointing it would free that address while the NAD minted for it still used it. Delete this claim and create a new one against the other pool."
 	// +required
 	PoolRef string `json:"poolRef"`
 
@@ -70,6 +82,21 @@ type IPRequestSpec struct {
 	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
 	// +optional
 	NAD string `json:"nad,omitempty"`
+
+	// allocation selects who chooses the address.
+	//
+	// Omitted means Auto: the controller takes the lowest free address in the pool.
+	// Exact requires spec.allocation.address, and the request fails rather than
+	// being given a different address if that one is out of range, excluded by the
+	// pool, or already held.
+	//
+	// Immutable. The address is bound to this claim and, when nad is set, written
+	// into the NAD the claim owns; changing the request would move an address out
+	// from under a running VM. Delete and recreate the claim to ask for a different
+	// one.
+	//
+	// +optional
+	Allocation *AddressAllocation `json:"allocation,omitempty"`
 }
 
 // IPRequestStatus defines the observed state of IPRequest.
@@ -82,14 +109,28 @@ type IPRequestStatus struct {
 	// +optional
 	AssignedIP string `json:"assignedIP,omitempty"`
 
+	// blockers names the holders standing in the way of an Exact request.
+	//
+	// Empty for Auto requests, which fail only when the pool itself is exhausted.
+	// On a failed Exact request this is the actionable half of the condition: the
+	// reason says AddressUnavailable, this says which claim or block holds the
+	// address and can be looked up directly. Cleared when the claim binds.
+	//
+	// +optional
+	// +listType=atomic
+	Blockers []Blocker `json:"blockers,omitempty"`
+
 	// conditions represent the current state of the IPRequest resource.
 	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
 	//
 	// Condition types set here:
 	// - "Ready": True once an address is assigned and, if spec.nad was set, its NAD exists.
 	//   The cause of a False goes in the condition's reason, e.g. "RangeExhausted" or
-	//   "PoolNotFound" -- there is no separate "Degraded" type, which would be its exact
-	//   complement and could drift out of step with it.
+	//   "PoolNotFound"; an Exact request that cannot have the address it named adds
+	//   "AddressOutOfRange", "AddressExcluded", "AddressUnavailable", "ExactNotAllowed"
+	//   or "AllocationInvalid", with the holders in status.blockers -- there is no
+	//   separate "Degraded" type, which would be its exact complement and could drift
+	//   out of step with it.
 	// - "TemplateMissing": True when spec.nad is set but the pool carries no nadTemplate,
 	//   so no NAD can be minted. Names a misconfiguration the user can fix.
 	// - "NADNameTaken": True when the name in spec.nad is already held by an object this
@@ -104,8 +145,10 @@ type IPRequestStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:resource:shortName=ipr
 // +kubebuilder:printcolumn:name="Pool",type=string,JSONPath=`.spec.poolRef`
 // +kubebuilder:printcolumn:name="Assigned",type=string,JSONPath=`.status.assignedIP`
+// +kubebuilder:printcolumn:name="Requested",type=string,JSONPath=`.spec.allocation.address`
 // +kubebuilder:printcolumn:name="NAD",type=string,JSONPath=`.spec.nad`
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Age",type=date,JSONPath=`.metadata.creationTimestamp`
